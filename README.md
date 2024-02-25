@@ -13,7 +13,7 @@ music-gallery-creator.py
 Generate a library file for a custom folder including video files, skipping folder names containing `testing` and `unsorted` (the index will be created under `~/Music/music.html`):
 
 ```bash
-music-gallery-creator.py ~/Music --videos -o music.html -i testing unsorted
+music-gallery-creator.py ~/Music --videos --output-file music.html --ignored testing unsorted
 ```
 
 ## Screenshots
