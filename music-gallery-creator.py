@@ -260,7 +260,6 @@ def generate_gallery_html(html_data, args):
             flex-direction: column;
             align-items: left;
             justify-content: left;
-
             max-height: 650px;
             border-radius: 4px;
             background-color: white;
@@ -272,7 +271,7 @@ def generate_gallery_html(html_data, args):
             box-shadow: 0px 2px 1px -1px rgba(0, 0, 0, .2), 0px 1px 1px 0px rgba(0, 0, 0, .14), 0px 1px 3px 0px rgba(0, 0, 0, .12);
         }
         .item img {
-            max-width: 23em;
+            width: 100%;
             height: auto;
             display: table-cell;
         }
