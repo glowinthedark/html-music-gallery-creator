@@ -18,7 +18,7 @@ music-gallery-creator.py ~/Music --videos --output-file music.html --ignored tes
 
 ## Screenshots
 
-![](https://telegra.ph/file/9a8783c925cd855666946.png)
+![](music-gallery-screen.png)
 
 ## Command line flags
 
