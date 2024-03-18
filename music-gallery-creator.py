@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import itertools
 import html
 import pathlib
 import shutil
@@ -26,9 +27,9 @@ IGNORED_PATHS = [
     '_thumb',
     '.config',
     '.thumb',
-    'dictionary/Contents',
     '/tests/',
     'cache/',
+    '/Library/Application/',
 ]
 
 total_images = 0
@@ -76,7 +77,7 @@ def pretty_size(bytes, units=UNITS_MAPPING) -> str:
 def funny_walk(start_dir, extensions, ignored_path_fragments):
     root_path = Path(start_dir)
 
-    for curpath in root_path.rglob('*'):
+    for curpath in itertools.chain([root_path], root_path.rglob('*')):
 
         if len([ignored for ignored in ignored_path_fragments if ignored.lower() in str(curpath.absolute()).lower()]):
             continue
@@ -100,14 +101,9 @@ def collect_media_assets(args) -> list[str]:
     global total_videos
     global total_albums
     top_of_the_tree: Path = args.gallery_root.absolute()
-    # thumbsdir = Path.expanduser(args.thumbnails_dir)
-    # thumbsdir.mkdir(exist_ok=True)
-
-    homedir = Path.expanduser(Path('~'))
 
     chunks: list[str] = []
 
-    files: list[Path]
     ignored_segments = IGNORED_PATHS + args.ignored
     for curdir, audios, images, videos in funny_walk(top_of_the_tree, ASSET_EXTENSIONS, ignored_segments):
 
@@ -260,6 +256,7 @@ def generate_gallery_html(html_data, args):
             flex-direction: column;
             align-items: left;
             justify-content: left;
+
             max-height: 650px;
             border-radius: 4px;
             background-color: white;
@@ -459,17 +456,6 @@ def generate_gallery_html(html_data, args):
             color: #f5c400;
         }
 
-        /* prevent body scroll when modal is shown */
-        .modal-open {
-            touch-action: none;
-            -webkit-overflow-scrolling: none;
-            overflow: hidden;
-            overscroll-behavior: none;
-            overflow-x: hidden;
-            overflow-y: scroll !important;
-            position: fixed;
-        }
-
         .maximized {
                 width: 98% !important;
                 height: 100% !important;
@@ -503,7 +489,6 @@ def generate_gallery_html(html_data, args):
 
             switch (e.which) {
                 case 27:    // = Escape
-                    hideModal();
                     break;
                 case 37: // left
                     if (v){
@@ -594,8 +579,6 @@ def generate_gallery_html(html_data, args):
 
             if (link && (link.matches("a"))) {
                 onLinkClicked(link, e);
-            } else if (!link && !document.querySelector('#popup1 .popup').contains(el)) {
-                hideModal();
             }
         }
 
@@ -624,50 +607,8 @@ const REGEX_TYPE_AUDIO = /\.(mp3|m4a|aac|flac|ape|wav|ogg|oga|webm)$/i;
 const REGEX_TYPE_VIDEO = /\.(mp4|m4v|avi|mov|mpg|mpeg|ogv|ogm|opus|mkv)$/i;
 const REGEX_TYPE_IMAGE = /\.(gif|jpe?g|a?png|tiff?|bmp|webp|ico|wmf|avif|svg)$/i;
 const REGEX_TYPE_CODE = /\.(asp|txt|memo|kt|go|ics|rst?|rb|dart|php|js|tsx?|py|cue|ipynb|z?sh|xml|plist|bat|css|json|java|c|cpp|h|m|hpp|conf|ini|pl|yaml|yml|groovy|swift|properties|gradle|srt|sql|lua|m3u8|log?)$/i;
-// const REGEX_TYPE_HTML = /\.(html?)$/i;
 const REGEX_TYPE_MARKDOWN = /\.(md)$/i;
 const REGEX_TYPE_CAN_PREVIEW = /\.(mp4|m4v|avi|mov|mpg|mpeg|ogv|ogm|opus|mkv|md|html?|gif|jpe?g|a?png|tiff?|bmp|webp|ico|wmf|avif|svg|asp|txt|memo|kt|go|ics|rst?|rb|dart|php|js|tsx?|py|cue|ipynb|z?sh|xml|plist|bat|css|json|java|c|cpp|h|m|hpp|conf|ini|pl|yaml|yml|groovy|swift|properties|gradle|srt|sql|lua|m3u8?)$/i;
-
-function escapeRegex(string) {
-    return string.replace(/[/\-\\^$*+?.()|[\]{}]/g, '\\$&');
-}
-
-function showModal (popup, popupThemeClass) {
-    window.lastScrollOffset = window.pageYOffset;
-    document.body.classList.add('modal-open');
-    document.body.style.top = `-${window.lastScrollOffsetllY}px`;
-
-    var popup = popup || document.querySelector('#popup1');
-    popup.style.display = 'block';
-
-    popup.classList.remove(popupThemeClass === 'day' ? 'night' : 'day');
-    popup.classList.add(popupThemeClass);
-}
-
-function hideModal (e) {
-    if (e) {
-        e.stopImmediatePropagation();
-        e.preventDefault();
-    }
-    var popup = document.querySelector('#popup1');
-
-    if (popup.style.display !== 'none') {
-        popup.style.display = 'none';
-        popup.querySelector('.content').innerHTML = '';
-
-        document.body.classList.remove('modal-open');
-
-        if (window.lastScrollOffset){
-            window.scrollTo(0, window.lastScrollOffset);
-        }
-    }
-}
-function toggleRestoreModal (popup) {
-    var popup = popup || document.querySelector('#popup1');
-    if (popup.style.display !== 'none') {
-        popup.querySelector('.popup').classList.toggle('maximized');
-    }
-}
 
 function onAudioEnded(el) {
     if (el && window.currentLink) {
@@ -722,7 +663,9 @@ function onLinkClicked(link, evt) {
     }
 
     if (window.currentLink && REGEX_TYPE_AUDIO.test(href)) {
-        window.currentLink.classList.remove('nowPlaying');
+        document.querySelectorAll('.nowPlaying').forEach(element => {
+          element.classList.remove('nowPlaying');
+        });
     }
     window.currentLink = link;
 
@@ -730,10 +673,6 @@ function onLinkClicked(link, evt) {
 
     const fileName = href.split('/').pop();
     const baseName = fileName.split('.')[0];
-
-    var popup = document.querySelector('#popup1');
-    var content = popup.querySelector('.content');
-    popup.querySelector('.info').textContent = decodeURIComponent(fileName);
 
     if (REGEX_TYPE_VIDEO.test(href)) {
         event.preventDefault();
@@ -778,7 +717,6 @@ function onLinkClicked(link, evt) {
 
         content.innerHTML = '';
         content.appendChild(video);
-        showModal(popup, 'night');
 
     }else if (REGEX_TYPE_AUDIO.test(href)) {
         event.preventDefault();
@@ -786,40 +724,7 @@ function onLinkClicked(link, evt) {
 
         startAudioPlayer(href);
         link.classList.add('nowPlaying');
-    }
-    // special treatment by extension
-    else if (REGEX_TYPE_MARKDOWN.test(href) || REGEX_TYPE_CODE.test(href)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        fetch(href)
-            .then(function (response) {
-                if (response.ok) {
-                    return response.text();
-                } else {
-                    throw new Error(response.statusText);
-                }
-            })
-            .then(function (text) {
 
-                showModal(popup, 'day');
-                var content = popup.querySelector('.content');
-                // Check if the window has marked library
-                if (href.match(REGEX_TYPE_MARKDOWN) && window.marked) {
-                    // Parse the markdown text as HTML and set it as the popup innerHTML
-                    content.innerHTML = marked.parse(text);
-                } else {
-                    content.innerHTML = `<pre><code>${text}</code></pre>`;
-                    window.hljs ? window.hljs.highlightAll() : console.error('nohljs!')
-                }
-            })
-            .catch(function (error) {
-                console.error(error);
-            });
-    } else if (REGEX_TYPE_IMAGE.test(href)) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        content.innerHTML = `<img src="${href}">`;
-        showModal(popup, 'night');
     } else if (window.location.search && !link.href.includes(window.location.search)) { // regular click
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -838,15 +743,6 @@ document.onclick = onDocumentClickHandler;
         <div id="maine">'''
                    + html_data
                    + '''</div>
-        <div id="popup1" class="overlay">
-            <div class="popup">
-                <h2 class="info"></h2>
-                <a class="max" onclick="toggleRestoreModal()" href="#">&#x26F6;</a>
-                <a class="close" onclick="hideModal(event)" href="#">&times;</a>
-                <div class="content">
-                </div>
-            </div>
-        </div>
     </body>
 </html>
 ''')
@@ -869,7 +765,7 @@ if __name__ == "__main__":
                         metavar='output_file',
                         default=OUTPUT_FILE_NAME,
                         help='Output filename')
-    parser.add_argument('--videos',
+    parser.add_argument('--videos', '-m',
                         default=False,
                         action='store_true',
                         help='Include videos')
