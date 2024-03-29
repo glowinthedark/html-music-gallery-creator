@@ -27,6 +27,7 @@ IGNORED_PATHS = [
     '_thumb',
     '.config',
     '.thumb',
+    'dictionary/Contents',
     '/tests/',
     'cache/',
     '/Library/Application/',
@@ -227,7 +228,7 @@ def generate_gallery_html(html_data, args):
         #maine {
             display: grid; 
             grid-template-columns: repeat(auto-fill, minmax(15em, 1fr)); 
-            gap: 1px;
+            gap: 2px;
         }
         ::-webkit-scrollbar-corner { background: rgba(0,0,0,0.5); }
 
@@ -271,13 +272,11 @@ def generate_gallery_html(html_data, args):
             width: 100%;
             height: auto;
             display: table-cell;
-            max-width: 15em;
         }
         .item video {
             width: auto;
             height: auto;
             display: table-cell;
-            max-width: 15em;
         }
 
         .list {
