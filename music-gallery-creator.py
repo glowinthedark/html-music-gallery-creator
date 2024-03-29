@@ -271,11 +271,13 @@ def generate_gallery_html(html_data, args):
             width: 100%;
             height: auto;
             display: table-cell;
+            max-width: 20em;
         }
         .item video {
             width: auto;
             height: auto;
             display: table-cell;
+            max-width: 20em;
         }
 
         .list {
