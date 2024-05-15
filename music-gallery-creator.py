@@ -75,7 +75,8 @@ def pretty_size(bytes, units=UNITS_MAPPING) -> str:
             suffix = multiple
     return str(amount) + suffix
 
-def funny_walk(start_dir, extensions, ignored_path_fragments):
+
+def funny_walk(start_dir, extensions, ignored_path_fragments, is_follow_symlinks=None):
     root_path = Path(start_dir)
 
     for curpath in itertools.chain([root_path], root_path.rglob('*')):
@@ -84,7 +85,7 @@ def funny_walk(start_dir, extensions, ignored_path_fragments):
             continue
 
         try:
-            if curpath.is_dir():
+            if curpath.is_dir() or (is_follow_symlinks and curpath.is_symlink() and curpath.readlink() and curpath.readlink().is_dir()):
                 # dirs = [subdir for subdir in curpath.iterdir() if subdir.is_dir()]
                 files = [file for file in curpath.iterdir() if file.is_file() and not file.name.startswith('._')]
                 audios = [f for f in files if f.suffix.lower() in AUDIO_EXTENSIONS]
@@ -106,7 +107,10 @@ def collect_media_assets(args) -> list[str]:
     chunks: list[str] = []
 
     ignored_segments = IGNORED_PATHS + args.ignored
-    for curdir, audios, images, videos in funny_walk(top_of_the_tree, ASSET_EXTENSIONS, ignored_segments):
+    for curdir, audios, images, videos in funny_walk(top_of_the_tree,
+                                                     ASSET_EXTENSIONS,
+                                                     ignored_segments,
+                                                     is_follow_symlinks=args.follow_symlinks):
 
         try:
             if len(audios):
@@ -141,26 +145,27 @@ def collect_media_assets(args) -> list[str]:
 </a>""")
                         total_images += 1
 
-                chunks.append('<div class="list">')
-                for audio_path in audios:
-                    size: int = audio_path.stat().st_size
-                    size_pretty: str = pretty_size(size)
-
-                    created_date = get_created_time(audio_path)
-
-                    created_date_formatted = created_date.strftime("%Y-%m-%d %H:%M:%S")
-                    relative_path = str(audio_path.relative_to(top_of_the_tree))
-                    escaped_path = quote(relative_path)
-
-                    chunks.append(f"""<p><a href="{escaped_path}" target="_blank" title="{relative_path} size: {size_pretty}; created: {created_date_formatted}">
-&#x25B6;&#xFE0F; {html.escape(audio_path.name)} <span class="meta">({size_pretty})</span></a></p>""")
-                    total_audios += 1
-
-                    if args.verbose:
-                        print(f'{audio_path}')
-                    elif total_audios % 42:
-                        print(f'audios:     {total_audios}              ', end='\r')
-                chunks.append("""</div></div>""")
+                if len(audios):
+                    chunks.append('<div class="list">')
+                    for audio_path in audios:
+                        size: int = audio_path.stat().st_size
+                        size_pretty: str = pretty_size(size)
+    
+                        created_date = get_created_time(audio_path)
+    
+                        created_date_formatted = created_date.strftime("%Y-%m-%d %H:%M:%S")
+                        relative_path = str(audio_path.relative_to(top_of_the_tree))
+                        escaped_path = quote(relative_path)
+    
+                        chunks.append(f"""<p><a href="{escaped_path}" target="_blank" title="{relative_path} size: {size_pretty}; created: {created_date_formatted}">
+    &#x25B6;&#xFE0F; {html.escape(audio_path.name)} <span class="meta">({size_pretty})</span></a></p>""")
+                        total_audios += 1
+    
+                        if args.verbose:
+                            print(f'{audio_path}')
+                        elif total_audios % 42:
+                            print(f'audios:     {total_audios}              ', end='\r')
+                    chunks.append("""</div></div>""")
             if args.videos and len(videos):
                 for video_path in videos:
                     total_videos += 1
@@ -757,7 +762,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Music gallery Generator')
     parser.add_argument('gallery_root',
-                        help='Gallery root, by default current folder',
+                        help='Gallery root, by default current folder (".")',
                         nargs='?',
                         action='store',
                         type=pathlib.Path,
@@ -765,7 +770,7 @@ if __name__ == "__main__":
     parser.add_argument('--output-file', '-o',
                         metavar='output_file',
                         default=OUTPUT_FILE_NAME,
-                        help='Output filename')
+                        help=f'Output filename ({OUTPUT_FILE_NAME}')
     parser.add_argument('--videos', '-m',
                         default=False,
                         action='store_true',
@@ -775,9 +780,13 @@ if __name__ == "__main__":
                         metavar='ignore',
                         default=[],
                         help='''Custom ignored path segments.
-                        Accepts multiple segments, e.g. -i junk1 junk2 junk3 "%s"''' % [])
+                        Accepts multiple segments, e.g. -i junk1 junk2 junk3 ("%s")''' % [])
+    parser.add_argument('--follow_symlinks', '-f',
+                        default=False,
+                        action='store_true',
+                        help='''Follow symlinks (False)''')
     parser.add_argument('--verbose', '-v',
-                        help='Verbose output',
+                        help='Verbose output (False)',
                         default=False,
                         action='store_true')
 
