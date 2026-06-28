@@ -7,13 +7,13 @@ Python script to create an HTML audio library file listing in a flat page all th
 Generate an HTML library with all audio files under the current folder. The default file name is `mu.html` in the target folder:
 
 ```bash
-music-gallery-creator.py
+mugal26.py
 ```
 
 Generate a library file for a custom folder including video files, skipping folder names containing `testing` and `unsorted` (the index will be created under `~/Music/music.html`):
 
 ```bash
-music-gallery-creator.py ~/Music --videos --output-file music.html --ignored testing unsorted
+mugal26.py ~/Music --verbose --output-file music.html
 ```
 
 ## Screenshots
