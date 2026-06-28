@@ -18,8 +18,6 @@ music-gallery-creator.py ~/Music --videos --output-file music.html --ignored tes
 
 ## Screenshots
 
-
-
 ![](mu.png)
 
 ## Command line flags
@@ -27,19 +25,24 @@ music-gallery-creator.py ~/Music --videos --output-file music.html --ignored tes
 For commmand line usage run `music-gallery-creator.py -h`:
 
 ```bash            
-usage: music-gallery-creator.py [-h] [--output-file output_file] [--videos] [--ignored [ignore ...]] [--verbose] [gallery_root]
+usage: mugal26.py [-h] [--output-file output_file] [--videos] [--ignored [ignore ...]]
+                [--follow_symlinks] [--verbose]
+                [gallery_root]
 
 Music gallery Generator
 
 positional arguments:
-  gallery_root          Gallery root, by default current folder
+  gallery_root          Gallery root, by default current folder (.)
 
 options:
   -h, --help            show this help message and exit
-  --output-file output_file, -o output_file
-                        Output filename
-  --videos              Include videos
-  --ignored [ignore ...], -i [ignore ...]
-                        Custom ignored path segments. Accepts multiple segments, e.g. -i junk1 junk2 junk3 "[]"
-  --verbose, -v         Verbose output
+  --output-file, -o output_file
+                        Output filename (mu.html)
+  --videos, -m          Include videos
+  --ignored, -i [ignore ...]
+                        Custom ignored path segments. Accepts multiple segments, e.g. -i junk1
+                        junk2 junk3 ([])
+  --follow_symlinks, -f
+                        Follow symlinks (False)
+  --verbose, -v         Verbose output (False)
 ```
