@@ -18,7 +18,9 @@ music-gallery-creator.py ~/Music --videos --output-file music.html --ignored tes
 
 ## Screenshots
 
-![](music-gallery-screen.png)
+
+
+![](mu.png)
 
 ## Command line flags
 
