@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+VERSION: 14.0611.22
 scan_music.py — Local music library scanner
 Generates audiodata.js + index.html for file:// playback.
 
@@ -10,7 +11,6 @@ Usage:
 """
 
 import argparse
-import base64
 import fnmatch
 import hashlib
 import json
@@ -23,23 +23,16 @@ from pathlib import Path
 # deps
 try:
     from mutagen import File as MutagenFile
-    from mutagen.id3 import ID3NoHeaderError
     HAS_MUTAGEN = True
 except ImportError:
     HAS_MUTAGEN = False
-
-try:
-    from PIL import Image
-    import io as _io
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".webm"}
 ART_NAMES  = {"cover", "folder", "album", "front", "artwork", "art"}
 ART_EXTS   = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-THUMB_SIZE = (80, 80)   # px for embedded base64 thumbnails
+MIME_EXT   = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+              "image/webp": ".webp", "image/gif": ".gif"}
 DATAFILE   = "audiodata.js"
 HTMLFILE   = "index.html"
 
@@ -60,7 +53,7 @@ def parse_args():
     )
     p.add_argument(
         "--no-art", action="store_true",
-        help="Skip embedding base64 album art thumbnails (smaller audiodata.js)"
+        help="Skip album art handling (no cover file lookup/extraction)"
     )
     p.add_argument(
         "--force-rescan", action="store_true",
@@ -73,10 +66,6 @@ def parse_args():
     p.add_argument(
         "--no-html", action="store_true",
         help="Only regenerate audiodata.js, skip writing index.html"
-    )
-    p.add_argument(
-        "--thumb-size", type=int, default=80, metavar="PX",
-        help="Thumbnail pixel size (square, default 80)"
     )
     p.add_argument(
         "--min-duration", type=float, default=0, metavar="SEC",
@@ -107,47 +96,25 @@ def find_art(folder: Path) -> Path | None:
         return candidates[0][1]
     return None
 
-def image_to_b64(path: Path, size: tuple[int,int]) -> str | None:
-    if not HAS_PIL:
-        # Fallback: raw file without resize
-        try:
-            data = path.read_bytes()
-            mime = "image/jpeg" if path.suffix.lower() in (".jpg",".jpeg") else "image/png"
-            return f"data:{mime};base64,{base64.b64encode(data).decode()}"
-        except Exception:
-            return None
+def get_embedded_art(mut) -> tuple[bytes, str] | None:
+    """Return (raw_bytes, mime) of embedded cover art, or None."""
     try:
-        img = Image.open(path).convert("RGB")
-        img.thumbnail(size, Image.LANCZOS)
-        buf = _io.BytesIO()
-        img.save(buf, "JPEG", quality=72, optimize=True)
-        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return None
-
-def extract_art_from_tags(mut) -> str | None:
-    """Try to pull embedded art from mutagen tags."""
-    if not HAS_PIL:
-        return None
-    try:
-        # ID3 APIC
-        if hasattr(mut, "tags") and mut.tags:
+        if getattr(mut, "tags", None):
+            # ID3 APIC
             for key in mut.tags.keys():
-                if key.startswith("APIC"):
+                if str(key).startswith("APIC"):
                     apic = mut.tags[key]
-                    img = Image.open(_io.BytesIO(apic.data)).convert("RGB")
-                    img.thumbnail(THUMB_SIZE, Image.LANCZOS)
-                    buf = _io.BytesIO()
-                    img.save(buf, "JPEG", quality=72, optimize=True)
-                    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+                    return apic.data, getattr(apic, "mime", "image/jpeg")
+            # MP4 covr
+            covr = mut.tags.get("covr")
+            if covr:
+                c = covr[0]
+                mime = "image/png" if getattr(c, "imageformat", 13) == 14 else "image/jpeg"
+                return bytes(c), mime
         # FLAC / Vorbis pictures
-        if hasattr(mut, "pictures") and mut.pictures:
+        if getattr(mut, "pictures", None):
             pic = mut.pictures[0]
-            img = Image.open(_io.BytesIO(pic.data)).convert("RGB")
-            img.thumbnail(THUMB_SIZE, Image.LANCZOS)
-            buf = _io.BytesIO()
-            img.save(buf, "JPEG", quality=72, optimize=True)
-            return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+            return pic.data, pic.mime or "image/jpeg"
     except Exception:
         pass
     return None
@@ -185,11 +152,13 @@ def get_int_tag(mut, *keys, default=0) -> int:
             pass
     return default
 
-def scan_file(path: Path, root: Path, embed_art: bool, thumb_size: int,
-              folder_art_cache: dict, min_duration: float) -> dict | None:
+def scan_file(path: Path, root: Path, min_duration: float) -> dict | None:
     """Return track metadata dict or None if not audio / too short."""
     rel = path.relative_to(root)
     rel_str = str(rel).replace("\\", "/")
+    folder_rel = str(rel.parent).replace("\\", "/")
+    if folder_rel == ".":
+        folder_rel = ""
 
     if not HAS_MUTAGEN:
         # Bare minimum without mutagen
@@ -197,15 +166,14 @@ def scan_file(path: Path, root: Path, embed_art: bool, thumb_size: int,
             "path": rel_str,
             "title": path.stem,
             "artist": "",
-            "album": str(rel.parent).replace("\\", "/"),
+            "album": folder_rel,
             "albumArtist": "",
             "track": 0,
             "disc": 0,
             "year": "",
             "genre": "",
             "duration": 0,
-            "art": None,
-            "folder": str(rel.parent).replace("\\", "/"),
+            "folder": folder_rel,
         }
 
     try:
@@ -220,10 +188,7 @@ def scan_file(path: Path, root: Path, embed_art: bool, thumb_size: int,
     if duration < min_duration:
         return None
 
-    folder_rel = str(rel.parent).replace("\\", "/")
-
     # ── Tags ──────────────────────────────────────────────────────────────────
-    # Try easy tags first (mutagen easy=False, so we handle both ID3 and Vorbis)
     title       = get_tag(mut, "TIT2", "title",       "\xa9nam", "TITLE",       default=path.stem)
     artist      = get_tag(mut, "TPE1", "artist",      "\xa9ART", "ARTIST",      default="")
     album       = get_tag(mut, "TALB", "album",       "\xa9alb", "ALBUM",       default=folder_rel)
@@ -236,20 +201,6 @@ def scan_file(path: Path, root: Path, embed_art: bool, thumb_size: int,
     # Normalise year to 4-digit string
     year = re.sub(r"[^\d].*", "", str(year))[:4] if year else ""
 
-    # ── Art ───────────────────────────────────────────────────────────────────
-    art = None
-    if embed_art:
-        ts = (thumb_size, thumb_size)
-        THUMB_SIZE = ts
-        # 1. embedded tags
-        art = extract_art_from_tags(mut)
-        # 2. folder image (cached per folder)
-        if not art:
-            if folder_rel not in folder_art_cache:
-                art_file = find_art(path.parent)
-                folder_art_cache[folder_rel] = image_to_b64(art_file, ts) if art_file else None
-            art = folder_art_cache[folder_rel]
-
     return {
         "path":        rel_str,
         "title":       title,
@@ -261,37 +212,50 @@ def scan_file(path: Path, root: Path, embed_art: bool, thumb_size: int,
         "year":        year,
         "genre":       genre,
         "duration":    round(duration, 2),
-        "art":         art,
         "folder":      folder_rel,
     }
 
-# ── Tree builder ──────────────────────────────────────────────────────────────
-def build_folder_tree(tracks: list[dict]) -> dict:
-    """Build nested folder structure from flat track list."""
-    tree = {}
-    for i, t in enumerate(tracks):
-        parts = t["folder"].split("/") if t["folder"] else [""]
-        node = tree
-        for part in parts:
-            if part not in node:
-                node[part] = {"__tracks__": [], "__children__": {}}
-            node = node[part]["__children__"] if part else node
-            if part:
-                node = tree
-                # rebuild reference
-                cur = tree
-                for p in parts:
-                    cur = cur[p]["__children__"]
-                break
-        # simpler flat approach: just record unique folders
-    # Return sorted unique folder paths
-    folders = sorted(set(t["folder"] for t in tracks))
-    return folders
+# ── Folder art resolution ─────────────────────────────────────────────────────
+def resolve_folder_art(tracks: list[dict], root: Path) -> dict[str, str]:
+    """
+    One cover image per folder, referenced by relative path (scaled in CSS):
+      1. an existing image file in the folder (cover/folder/album/...)
+      2. else embedded art from the first track that has any, extracted
+         once to cover.<ext> in that folder
+    Returns {folder_rel: art_rel_path}.
+    """
+    folder_art: dict[str, str] = {}
+    by_folder: dict[str, list[dict]] = {}
+    for t in tracks:
+        by_folder.setdefault(t["folder"], []).append(t)
+
+    for folder_rel, folder_tracks in by_folder.items():
+        folder = root / folder_rel if folder_rel else root
+        art_file = find_art(folder)
+        if not art_file and HAS_MUTAGEN:
+            for t in folder_tracks:
+                try:
+                    mut = MutagenFile(root / t["path"], easy=False)
+                except Exception:
+                    continue
+                emb = get_embedded_art(mut) if mut else None
+                if emb:
+                    data, mime = emb
+                    art_file = folder / ("cover" + MIME_EXT.get(mime.lower(), ".jpg"))
+                    if not art_file.exists():
+                        try:
+                            art_file.write_bytes(data)
+                            print(f"  ✓ Extracted {art_file.relative_to(root)}")
+                        except Exception:
+                            art_file = None
+                    break
+        if art_file:
+            folder_art[folder_rel] = str(art_file.relative_to(root)).replace("\\", "/")
+    return folder_art
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
-def scan(root: Path, args) -> list[dict]:
+def scan(root: Path, args) -> tuple[list[dict], dict[str, str]]:
     tracks = []
-    folder_art_cache = {}
     all_files = sorted(root.rglob("*"))
     audio_files = [f for f in all_files
                    if f.is_file()
@@ -301,7 +265,7 @@ def scan(root: Path, args) -> list[dict]:
     total = len(audio_files)
     if not total:
         print("⚠  No audio files found.", file=sys.stderr)
-        return []
+        return [], {}
 
     print(f"Scanning {total} audio files…")
     t0 = time.time()
@@ -314,22 +278,18 @@ def scan(root: Path, args) -> list[dict]:
             bar = "█" * pct + "░" * (50 - pct)
             print(f"\r  [{bar}] {i+1}/{total}", end="", flush=True)
 
-        track = scan_file(
-            f, root,
-            embed_art=not args.no_art,
-            thumb_size=args.thumb_size,
-            folder_art_cache=folder_art_cache,
-            min_duration=args.min_duration,
-        )
+        track = scan_file(f, root, min_duration=args.min_duration)
         if track:
             tracks.append(track)
 
     elapsed = time.time() - t0
     print(f"\n✓ Scanned {len(tracks)} tracks in {elapsed:.1f}s")
-    return tracks
+
+    folder_art = {} if args.no_art else resolve_folder_art(tracks, root)
+    return tracks, folder_art
 
 # ── Write audiodata.js ────────────────────────────────────────────────────────
-def write_datafile(tracks: list[dict], out_dir: Path, root: Path) -> str:
+def write_datafile(tracks: list[dict], folder_art: dict, out_dir: Path, root: Path) -> str:
     """Write audiodata.js and return its version hash."""
     payload = {
         "version":   hashlib.md5(
@@ -338,6 +298,7 @@ def write_datafile(tracks: list[dict], out_dir: Path, root: Path) -> str:
         "generated": int(time.time()),
         "root":      str(root),
         "count":     len(tracks),
+        "folderArt": folder_art,
         "tracks":    tracks,
     }
     js_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -374,10 +335,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   --radius:    6px;
   --sans:      'Inter',-apple-system,sans-serif;
   --mono:      'JetBrains Mono','Fira Mono',monospace;
-  --now-h:     56px;
+  --now-h:     4rem;
   --tree-w:    260px;
 }
-html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.4}
+html{font-size:14px} /* overridden by the font-size setting; all text is rem-based */
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.4}
 
 /* ── Layout ─────────────────────────────────────────────────────────────── */
 #app{display:flex;flex-direction:column;height:100vh}
@@ -390,76 +352,121 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 #nowbar{height:var(--now-h);background:var(--panel);border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;padding:0 16px;flex-shrink:0}
 
 /* ── Topbar ─────────────────────────────────────────────────────────────── */
-#logo{font-family:var(--mono);font-size:13px;color:var(--accent);letter-spacing:.08em;white-space:nowrap;margin-right:4px}
-#search{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);padding:6px 10px;font-size:13px;outline:none;font-family:var(--sans);min-width:0}
+#logo{font-family:var(--mono);font-size:0.9286rem;color:var(--accent);letter-spacing:.08em;white-space:nowrap;margin-right:4px}
+#search{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);padding:6px 10px;font-size:0.9286rem;outline:none;font-family:var(--sans);min-width:0}
 #search:focus{border-color:var(--accent)}
 #search::placeholder{color:var(--text3)}
-#stats{font-size:11px;color:var(--text3);white-space:nowrap;font-family:var(--mono)}
-#settingsbtn{background:none;border:none;cursor:pointer;color:var(--text2);font-size:16px;padding:4px 6px;border-radius:var(--radius)}
+#stats{font-size:0.7857rem;color:var(--text3);white-space:nowrap;font-family:var(--mono)}
+#settingsbtn{background:none;border:none;cursor:pointer;color:var(--text2);font-size:1.1429rem;padding:4px 6px;border-radius:var(--radius)}
 #settingsbtn:hover{color:var(--text);background:var(--bg3)}
 
 /* ── Settings popover ───────────────────────────────────────────────────── */
 #settingspop{position:fixed;top:44px;right:14px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;z-index:100;display:none;min-width:220px;box-shadow:0 8px 32px rgba(0,0,0,.6)}
 #settingspop.open{display:block}
-#settingspop h3{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+#settingspop h3{font-size:0.7857rem;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
 .sp-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px}
-.sp-row span{font-size:12px;color:var(--text2)}
-.sp-btn{background:var(--bg);border:1px solid var(--border);color:var(--text);font-size:11px;padding:4px 10px;border-radius:var(--radius);cursor:pointer}
+.sp-row span{font-size:0.8571rem;color:var(--text2)}
+.sp-btn{background:var(--bg);border:1px solid var(--border);color:var(--text);font-size:0.7857rem;padding:4px 10px;border-radius:var(--radius);cursor:pointer}
 .sp-btn:hover{border-color:var(--accent);color:var(--accent)}
 .sp-btn.danger:hover{border-color:#c84040;color:#c84040}
-#idb-status{font-size:10px;color:var(--text3);font-family:var(--mono);margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
+.sp-stepper{display:flex;align-items:center;gap:6px}
+.sp-stepper .sp-btn{padding:2px 8px;font-family:var(--mono);line-height:1.2}
+#fs-val{font-family:var(--mono);font-size:0.7857rem;color:var(--text);width:34px;text-align:center}
+#idb-status{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
 
 /* ── Sidebar tree ───────────────────────────────────────────────────────── */
-#tree-header{padding:10px 12px 6px;font-size:10px;color:var(--text3);letter-spacing:.1em;text-transform:uppercase;flex-shrink:0}
+#tree-header{padding:10px 12px 6px;font-size:0.7143rem;color:var(--text3);letter-spacing:.1em;text-transform:uppercase;flex-shrink:0}
 #tree{flex:1;overflow-y:auto;padding-bottom:8px}
-.tn{display:flex;align-items:center;gap:5px;padding:4px 10px 4px;cursor:pointer;border-radius:4px;margin:1px 4px;font-size:12px;color:var(--text2);transition:background .1s}
+.tn{display:flex;align-items:center;gap:5px;padding:4px 10px 4px;cursor:pointer;border-radius:4px;margin:1px 4px;font-size:0.8571rem;color:var(--text2);transition:background .1s}
 .tn:hover{background:var(--hover);color:var(--text)}
 .tn.active{background:var(--sel);color:var(--accent)}
-.tn .arrow{width:12px;text-align:center;color:var(--text3);font-size:9px;flex-shrink:0;transition:transform .15s}
+.tn .arrow{width:12px;text-align:center;color:var(--text3);font-size:0.6429rem;flex-shrink:0;transition:transform .15s}
 .tn.open .arrow{transform:rotate(90deg)}
-.tn .icon{flex-shrink:0;opacity:.6;font-size:11px}
-.tn .label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:11px}
-.tn .cnt{font-size:9px;color:var(--text3);flex-shrink:0}
+.tn .icon{flex-shrink:0;opacity:.6;font-size:0.7857rem}
+.tn .label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:0.7857rem}
+.tn .cnt{font-size:0.6429rem;color:var(--text3);flex-shrink:0}
 .tc{padding-left:16px;overflow:hidden}
 .tc.collapsed{display:none}
 
 /* ── Track list ─────────────────────────────────────────────────────────── */
-#tracklist-header{display:grid;grid-template-columns:28px 1fr 160px 100px 50px;gap:0;padding:6px 14px;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);font-size:10px;color:var(--text3);letter-spacing:.08em;text-transform:uppercase;z-index:5}
+#tracklist-header{display:grid;grid-template-columns:28px 1fr 160px 100px 50px;gap:0;padding:6px 14px;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);font-size:0.7143rem;color:var(--text3);letter-spacing:.08em;text-transform:uppercase;z-index:5}
 .tr{display:grid;grid-template-columns:28px 1fr 160px 100px 50px;gap:0;padding:5px 14px;cursor:pointer;border-radius:4px;margin:1px 4px;transition:background .08s;align-items:center}
 .tr:hover{background:var(--hover)}
 .tr.playing{background:rgba(63,200,122,.07)}
 .tr.playing .t-title{color:var(--playing)}
 .tr.selected{background:var(--sel)}
-.tr .t-num{font-size:11px;color:var(--text3);font-family:var(--mono);text-align:right;padding-right:8px}
+.tr .t-num{font-size:0.7857rem;color:var(--text3);font-family:var(--mono);text-align:right;padding-right:8px}
 .tr.playing .t-num{color:var(--playing)}
 .t-info{display:flex;flex-direction:column;overflow:hidden;gap:1px}
-.t-title{font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.t-sub{font-size:11px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.t-artist{font-size:12px;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.t-album{font-size:11px;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
-.t-dur{font-size:11px;color:var(--text3);font-family:var(--mono);text-align:right}
+.t-title{font-size:0.9286rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t-sub{font-size:0.7857rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t-artist{font-size:0.8571rem;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t-album{font-size:0.7857rem;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
+.t-dur{font-size:0.7857rem;color:var(--text3);font-family:var(--mono);text-align:right}
 em.hl{color:var(--accent);font-style:normal}
+
+/* ── Album group headers ────────────────────────────────────────────────── */
+.album-h{display:flex;align-items:center;gap:10px;padding:8px 14px 6px;margin:8px 4px 2px;border-bottom:1px solid var(--border);cursor:context-menu}
+.album-h .ah-art{width:40px;height:40px;border-radius:4px;background:var(--bg3);flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:1.2857rem;color:var(--text3)}
+.album-h .ah-art img{width:100%;height:100%;object-fit:cover}
+.album-h .ah-name{font-size:0.9286rem;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.album-h .ah-meta{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);white-space:nowrap}
+.album-h .ah-text{overflow:hidden;min-width:0}
+
+/* ── Context menu ───────────────────────────────────────────────────────── */
+#ctxmenu{position:fixed;z-index:300;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 32px rgba(0,0,0,.6);padding:4px;display:none;min-width:180px;user-select:none}
+#ctxmenu.open{display:block}
+.cm-item{display:flex;align-items:center;gap:8px;padding:6px 12px;font-size:0.8571rem;color:var(--text2);border-radius:4px;cursor:pointer;white-space:nowrap}
+.cm-item:hover{background:var(--hover);color:var(--text)}
+.cm-item .cm-ico{width:16px;text-align:center;opacity:.7;flex-shrink:0}
+.cm-sep{height:1px;background:var(--border);margin:4px 6px}
+
+/* ── Track info modal ───────────────────────────────────────────────────── */
+#modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:400;display:none;align-items:center;justify-content:center}
+#modal-overlay.open{display:flex}
+#modal{background:var(--bg2);border:1px solid var(--border);border-radius:10px;box-shadow:0 16px 64px rgba(0,0,0,.7);width:min(440px,92vw);max-height:86vh;overflow-y:auto;padding:0}
+#modal-head{display:flex;align-items:center;gap:12px;padding:16px 18px 12px;border-bottom:1px solid var(--border)}
+#modal-head .mh-art{width:64px;height:64px;border-radius:6px;background:var(--bg3);flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:1.8571rem;color:var(--text3)}
+#modal-head .mh-art img{width:100%;height:100%;object-fit:cover}
+#modal-head .mh-title{font-size:1.0714rem;color:var(--text);word-break:break-word}
+#modal-head .mh-sub{font-size:0.8571rem;color:var(--text2);margin-top:2px}
+#modal-close{margin-left:auto;align-self:flex-start;background:none;border:none;color:var(--text3);font-size:1.1429rem;cursor:pointer;padding:2px 6px;border-radius:4px}
+#modal-close:hover{color:var(--text);background:var(--bg3)}
+#modal-body{padding:12px 18px}
+.mi-row{display:flex;gap:10px;padding:4px 0;font-size:0.8571rem}
+.mi-row .mi-k{width:92px;flex-shrink:0;color:var(--text3);text-transform:uppercase;font-size:0.7143rem;letter-spacing:.06em;padding-top:1px}
+.mi-row .mi-v{color:var(--text2);word-break:break-word;font-family:var(--mono);font-size:0.7857rem}
+#modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:10px 18px 14px;border-top:1px solid var(--border)}
+
+/* ── Art hover preview ──────────────────────────────────────────────────── */
+#artpreview{position:fixed;z-index:500;pointer-events:none;display:none;border-radius:8px;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.8);border:1px solid var(--border)}
+#artpreview img{display:block;max-width:320px;max-height:320px}
 
 /* ── Now playing bar ────────────────────────────────────────────────────── */
 #np-art{width:36px;height:36px;border-radius:3px;background:var(--bg3);flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center}
 #np-art img{width:100%;height:100%;object-fit:cover}
-#np-art .placeholder{font-size:18px;opacity:.3}
+#np-art .placeholder{font-size:1.2857rem;opacity:.3}
 #np-info{flex:1;min-width:0}
-#np-title{font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#np-artist{font-size:11px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#np-title{font-size:0.9286rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#np-artist{font-size:0.7857rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#queue-info{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);white-space:nowrap;flex-shrink:0}
 #controls{display:flex;align-items:center;gap:4px;flex-shrink:0}
-.ctrl{background:none;border:none;color:var(--text2);cursor:pointer;padding:6px;border-radius:var(--radius);font-size:16px;transition:color .1s}
+.ctrl{background:none;border:none;color:var(--text2);cursor:pointer;padding:6px;border-radius:var(--radius);font-size:1.1429rem;transition:color .1s}
 .ctrl:hover{color:var(--text)}
 .ctrl.active{color:var(--accent)}
 #scrubber-wrap{flex:1;display:flex;align-items:center;gap:8px;min-width:0;max-width:320px}
-#time-cur,#time-tot{font-size:10px;color:var(--text3);font-family:var(--mono);width:32px;flex-shrink:0}
+#time-cur,#time-tot{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);width:32px;flex-shrink:0}
 #time-tot{text-align:right}
 #scrubber{flex:1;-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;background:var(--bg3);outline:none;cursor:pointer}
 #scrubber::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;background:var(--accent);cursor:pointer}
 #vol-wrap{display:flex;align-items:center;gap:6px;flex-shrink:0}
 #vol{width:70px;-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;background:var(--bg3);outline:none;cursor:pointer}
 #vol::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;background:var(--text2);cursor:pointer}
-#vol-icon{font-size:14px;color:var(--text3)}
+#vol-icon{font-size:1rem;color:var(--text3)}
+
+/* ── Toast ──────────────────────────────────────────────────────────────── */
+#toast{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--border);color:var(--text2);font-size:0.8571rem;padding:7px 16px;border-radius:20px;z-index:600;opacity:0;transition:opacity .2s;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+#toast.show{opacity:1}
 
 /* ── Scrollbars ─────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -469,9 +476,9 @@ em.hl{color:var(--accent);font-style:normal}
 
 /* ── Empty/loading states ───────────────────────────────────────────────── */
 #loader{display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:8px;color:var(--text3)}
-#loader .spin{font-size:24px;animation:spin 1s linear infinite}
+#loader .spin{font-size:1.7143rem;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-#empty{display:none;align-items:center;justify-content:center;height:100%;color:var(--text3);font-size:13px}
+#empty{display:none;align-items:center;justify-content:center;height:100%;color:var(--text3);font-size:0.9286rem}
 
 /* ── Responsive resizer ─────────────────────────────────────────────────── */
 @media(max-width:640px){
@@ -498,6 +505,13 @@ em.hl{color:var(--accent);font-style:normal}
     <div class="sp-row"><span>Reload data from disk</span><button class="sp-btn" id="btn-reload">Reload</button></div>
     <div class="sp-row"><span>Clear IndexedDB cache</span><button class="sp-btn danger" id="btn-clear-idb">Clear cache</button></div>
     <div class="sp-row"><span>Shuffle all</span><button class="sp-btn" id="btn-shuffle-all">Shuffle</button></div>
+    <div class="sp-row"><span>Font size</span>
+      <span class="sp-stepper">
+        <button class="sp-btn" id="fs-minus" title="Smaller">−</button>
+        <span id="fs-val">14</span>
+        <button class="sp-btn" id="fs-plus" title="Larger">+</button>
+      </span>
+    </div>
     <div id="idb-status"></div>
   </div>
 
@@ -516,6 +530,7 @@ em.hl{color:var(--accent);font-style:normal}
         <div></div><div>Title</div><div>Artist</div><div>Album</div><div>Time</div>
       </div>
       <div id="tracks-container"></div>
+      <div id="list-sentinel"></div>
       <div id="empty">No tracks match your search.</div>
     </div>
   </div>
@@ -524,9 +539,10 @@ em.hl{color:var(--accent);font-style:normal}
   <div id="nowbar">
     <div id="np-art"><span class="placeholder">♪</span></div>
     <div id="np-info"><div id="np-title" style="color:var(--text3)">Nothing playing</div><div id="np-artist"></div></div>
+    <span id="queue-info"></span>
     <div id="controls">
       <button class="ctrl" id="btn-prev" title="Previous">⏮</button>
-      <button class="ctrl" id="btn-play" title="Play/Pause" style="font-size:20px">▶</button>
+      <button class="ctrl" id="btn-play" title="Play/Pause" style="font-size:1.4286rem">▶</button>
       <button class="ctrl" id="btn-next" title="Next">⏭</button>
       <button class="ctrl" id="btn-repeat" title="Repeat">🔁</button>
       <button class="ctrl" id="btn-shuffle" title="Shuffle">🔀</button>
@@ -543,6 +559,24 @@ em.hl{color:var(--accent);font-style:normal}
   </div>
 </div>
 
+<!-- Context menu -->
+<div id="ctxmenu"></div>
+
+<!-- Track info modal -->
+<div id="modal-overlay">
+  <div id="modal">
+    <div id="modal-head"></div>
+    <div id="modal-body"></div>
+    <div id="modal-foot"><button class="sp-btn" id="modal-cancel">Cancel</button></div>
+  </div>
+</div>
+
+<!-- Art hover preview -->
+<div id="artpreview"><img alt=""></div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
 <audio id="audio" preload="metadata"></audio>
 
 <script src="audiodata.js"></script>
@@ -556,16 +590,17 @@ const IDB_STORE   = "library";
 const IDB_VER     = 1;
 const IDB_KEY     = "data";
 const USE_IDB_MIN = 300; // tracks threshold
+const CHUNK       = 200; // rows rendered per lazy chunk
 
 // === State ===
 let ALL_TRACKS    = [];
-let VIEW_TRACKS   = [];   // currently displayed subset
+let FOLDER_ART    = {};   // folder rel path → cover image rel path
+let VIEW          = [];   // currently displayed subset (indices into ALL_TRACKS)
 let QUEUE         = [];   // play queue (indices into ALL_TRACKS)
 let QUEUE_POS     = -1;
 let ACTIVE_FOLDER = null; // null = all
 let SHUFFLED      = false;
 let REPEAT        = 0;    // 0=off 1=all 2=one
-let SEARCHING     = false;
 let idbAvailable  = false;
 
 // === DOM refs ===
@@ -575,17 +610,21 @@ const searchEl    = $("search");
 const statsEl     = $("stats");
 const treeEl      = $("tree");
 const tracksEl    = $("tracks-container");
+const sentinelEl  = $("list-sentinel");
 const loaderEl    = $("loader");
 const emptyEl     = $("empty");
 const headerEl    = $("tracklist-header");
 const npTitle     = $("np-title");
 const npArtist    = $("np-artist");
 const npArt       = $("np-art");
+const queueInfoEl = $("queue-info");
 const scrubber    = $("scrubber");
 const timeCur     = $("time-cur");
 const timeTot     = $("time-tot");
 const volEl       = $("vol");
 const idbStatus   = $("idb-status");
+const ctxEl       = $("ctxmenu");
+const toastEl     = $("toast");
 
 const fmt = s => {
   if (!s || isNaN(s)) return "0:00";
@@ -593,8 +632,13 @@ const fmt = s => {
   return `${m}:${sec.toString().padStart(2,"0")}`;
 };
 
-const esc = s => s.replace(/[&<>"']/g, c =>
+const esc = s => String(s).replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+// Encode a relative path for use as a URL (handles #, ?, brackets…)
+const encPath = p => p.split("/").map(encodeURIComponent).join("/");
+
+const artOf = t => FOLDER_ART[t.folder] || null;
 
 function highlight(str, q) {
   if (!q) return esc(str);
@@ -603,6 +647,14 @@ function highlight(str, q) {
   return esc(str.slice(0,idx)) +
     `<em class="hl">${esc(str.slice(idx, idx+q.length))}</em>` +
     esc(str.slice(idx+q.length));
+}
+
+let toastTimer = null;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 1800);
 }
 
 // === IndexedDB ===
@@ -646,6 +698,7 @@ async function boot() {
     loaderEl.innerHTML = '<span>⚠ audiodata.js not found or empty.<br>Run scan_music.py in this folder.</span>';
     return;
   }
+  FOLDER_ART = raw.folderArt || {};
 
   const useIDB = raw.tracks.length > USE_IDB_MIN;
 
@@ -655,17 +708,14 @@ async function boot() {
       idbAvailable = true;
       const cached = await idbGet(db, IDB_KEY);
       if (cached && cached.version === raw.version) {
-        // Cache hit — use IDB data
         ALL_TRACKS = cached.tracks;
         idbStatus.textContent = `IDB cache hit · v${raw.version} · ${ALL_TRACKS.length} tracks`;
       } else {
-        // Cache miss — persist fresh data
         ALL_TRACKS = raw.tracks;
         await idbSet(db, IDB_KEY, { version: raw.version, tracks: raw.tracks });
         idbStatus.textContent = `IDB refreshed · v${raw.version} · ${ALL_TRACKS.length} tracks`;
       }
     } catch(e) {
-      // IDB failed (e.g. file:// in some browsers) — fall through
       ALL_TRACKS = raw.tracks;
       idbStatus.textContent = "IDB unavailable — using direct load";
     }
@@ -714,66 +764,127 @@ function renderTree(node, depth, parentPath) {
   return html;
 }
 
-// ==== track list ======
-function renderTracks(tracks, query) {
-  if (!tracks.length) {
+// ==== track list (lazy chunked rendering) ======
+let renderItems  = [];  // [{h: folder, n: count}] header | [{t: globalIdx}] track
+let renderedUpTo = 0;
+let renderQuery  = "";
+
+const listObserver = new IntersectionObserver(entries => {
+  if (entries.some(e => e.isIntersecting)) appendChunk();
+});
+
+function rowHTML(item, q) {
+  if (item.h !== undefined) {
+    const art = FOLDER_ART[item.h];
+    const name = item.h.split("/").pop() || "[root]";
+    return `<div class="album-h" data-folder="${esc(item.h)}" title="${esc(item.h)}">
+      <div class="ah-art"${art ? ` data-art="${esc(encPath(art))}"` : ""}>${
+        art ? `<img src="${esc(encPath(art))}" loading="lazy" alt="">` : "♪"}</div>
+      <div class="ah-text">
+        <div class="ah-name">${highlight(name, q)}</div>
+        <div class="ah-meta">${esc(item.h)} · ${item.n} track${item.n===1?"":"s"}</div>
+      </div>
+    </div>`;
+  }
+  const i = item.t, t = ALL_TRACKS[i];
+  const isPlaying = QUEUE[QUEUE_POS] === i;
+  const num = t.track ? t.track : "·";
+  return `<div class="tr${isPlaying?" playing":""}" data-idx="${i}">
+    <div class="t-num">${num}</div>
+    <div class="t-info">
+      <div class="t-title" title="${esc(t.title||t.path)}">${highlight(t.title||t.path,q)}</div>
+      ${t.artist?`<div class="t-sub" title="${esc(t.artist)}">${highlight(t.artist,q)}</div>`:""}
+    </div>
+    <div class="t-artist" title="${esc(t.artist||"")}">${highlight(t.artist||"",q)}</div>
+    <div class="t-album" title="${esc(t.album||"")}">${highlight(t.album||"",q)}</div>
+    <div class="t-dur">${fmt(t.duration)}</div>
+  </div>`;
+}
+
+function appendChunk() {
+  if (renderedUpTo >= renderItems.length) return;
+  const end = Math.min(renderedUpTo + CHUNK, renderItems.length);
+  let html = "";
+  for (let i = renderedUpTo; i < end; i++) html += rowHTML(renderItems[i], renderQuery);
+  tracksEl.insertAdjacentHTML("beforeend", html);
+  renderedUpTo = end;
+  if (renderedUpTo >= renderItems.length) listObserver.unobserve(sentinelEl);
+}
+
+function renderTracks(view, query) {
+  listObserver.unobserve(sentinelEl);
+  renderQuery = query || "";
+  if (!view.length) {
     tracksEl.innerHTML = "";
+    renderItems = [];
     emptyEl.style.display = "flex";
     headerEl.style.display = "none";
     return;
   }
   emptyEl.style.display = "none";
   headerEl.style.display = "grid";
-  const q = query || "";
-  const rows = tracks.map(t => {
-    const globalIdx = ALL_TRACKS.indexOf(t);
-    const isPlaying = QUEUE[QUEUE_POS] === globalIdx;
-    const num = t.track ? t.track : "·";
-    return `<div class="tr${isPlaying?" playing":""}" data-idx="${globalIdx}">
-      <div class="t-num">${num}</div>
-      <div class="t-info">
-        <div class="t-title">${highlight(t.title||t.path,q)}</div>
-        ${t.artist?`<div class="t-sub">${highlight(t.artist,q)}</div>`:""}
-      </div>
-      <div class="t-artist">${highlight(t.artist||"",q)}</div>
-      <div class="t-album">${highlight(t.album||"",q)}</div>
-      <div class="t-dur">${fmt(t.duration)}</div>
-    </div>`;
-  }).join("");
-  tracksEl.innerHTML = rows;
-  statsEl.textContent = `${tracks.length} tracks`;
+
+  // Group headers when the view spans multiple folders
+  const folders = new Set();
+  view.forEach(i => folders.add(ALL_TRACKS[i].folder));
+  renderItems = [];
+  if (folders.size > 1) {
+    const counts = {};
+    view.forEach(i => { const f = ALL_TRACKS[i].folder; counts[f] = (counts[f]||0)+1; });
+    let cur = null;
+    for (const i of view) {
+      const f = ALL_TRACKS[i].folder;
+      if (f !== cur) { cur = f; renderItems.push({ h: f, n: counts[f] }); }
+      renderItems.push({ t: i });
+    }
+  } else {
+    for (const i of view) renderItems.push({ t: i });
+  }
+
+  tracksEl.innerHTML = "";
+  renderedUpTo = 0;
+  appendChunk();
+  if (renderedUpTo < renderItems.length) listObserver.observe(sentinelEl);
+  statsEl.textContent = `${view.length} tracks`;
+  $("tracklist").scrollTop = 0;
 }
 
 //====== Search =====
 let searchTimer = null;
+function folderPool() {
+  if (ACTIVE_FOLDER === null) return ALL_TRACKS.map((_, i) => i);
+  return folderTrackIdxs(ACTIVE_FOLDER);
+}
 function doSearch(q) {
   q = q.trim().toLowerCase();
-  SEARCHING = !!q;
-  if (!q) {
-    VIEW_TRACKS = ACTIVE_FOLDER
-      ? ALL_TRACKS.filter(t => t.folder === ACTIVE_FOLDER || t.folder.startsWith(ACTIVE_FOLDER+"/"))
-      : ALL_TRACKS;
-  } else {
-    const pool = ACTIVE_FOLDER
-      ? ALL_TRACKS.filter(t => t.folder === ACTIVE_FOLDER || t.folder.startsWith(ACTIVE_FOLDER+"/"))
-      : ALL_TRACKS;
-    VIEW_TRACKS = pool.filter(t =>
-      (t.title  ||"").toLowerCase().includes(q) ||
-      (t.artist ||"").toLowerCase().includes(q) ||
-      (t.album  ||"").toLowerCase().includes(q) ||
-      (t.folder ||"").toLowerCase().includes(q)
-    );
-  }
-  renderTracks(VIEW_TRACKS, q);
+  const pool = folderPool();
+  VIEW = !q ? pool : pool.filter(i => {
+    const t = ALL_TRACKS[i];
+    return (t.title  ||"").toLowerCase().includes(q) ||
+           (t.artist ||"").toLowerCase().includes(q) ||
+           (t.album  ||"").toLowerCase().includes(q) ||
+           (t.folder ||"").toLowerCase().includes(q);
+  });
+  renderTracks(VIEW, q);
 }
 
 //////////  Playback //////////////
+function folderTrackIdxs(folder) {
+  const idxs = [];
+  for (let i = 0; i < ALL_TRACKS.length; i++) {
+    const f = ALL_TRACKS[i].folder;
+    if (f === folder || f.startsWith(folder + "/")) idxs.push(i);
+  }
+  return idxs;
+}
+
 function buildQueue(startIdx) {
-  // Queue = all VIEW_TRACKS in order, start from clicked track
-  QUEUE = VIEW_TRACKS.map(t => ALL_TRACKS.indexOf(t));
+  // Queue = current VIEW in order, start from clicked track
+  QUEUE = [...VIEW];
   const pos = QUEUE.indexOf(startIdx);
   QUEUE_POS = pos >= 0 ? pos : 0;
   if (SHUFFLED) shuffleQueue(pos >= 0 ? pos : 0);
+  updateQueueInfo();
 }
 
 function shuffleQueue(keepFirst) {
@@ -785,28 +896,39 @@ function shuffleQueue(keepFirst) {
   }
   QUEUE.unshift(first);
   QUEUE_POS = 0;
+  updateQueueInfo();
+}
+
+function updateQueueInfo() {
+  queueInfoEl.textContent = QUEUE.length
+    ? `♬ ${QUEUE_POS+1}/${QUEUE.length}` : "";
 }
 
 function playTrack(globalIdx) {
   const t = ALL_TRACKS[globalIdx];
   if (!t) return;
-  audio.src = t.path;
+  audio.src = encPath(t.path);
   audio.volume = parseFloat(volEl.value);
   audio.play().catch(()=>{});
   updateNowBar(t);
   highlightPlaying(globalIdx);
-  // save to session
+  updateQueueInfo();
   try { sessionStorage.setItem("lastTrack", globalIdx); } catch(_){}
 }
 
 function updateNowBar(t) {
   npTitle.textContent  = t.title  || t.path;
+  npTitle.title        = t.title  || t.path;
   npArtist.textContent = [t.artist, t.album].filter(Boolean).join(" — ");
+  npArtist.title       = npArtist.textContent;
   npTitle.style.color  = "";
-  if (t.art) {
-    npArt.innerHTML = `<img src="${t.art}" alt="">`;
+  const art = artOf(t);
+  if (art) {
+    npArt.innerHTML = `<img src="${esc(encPath(art))}" alt="">`;
+    npArt.dataset.art = encPath(art);
   } else {
     npArt.innerHTML = `<span class="placeholder">♪</span>`;
+    delete npArt.dataset.art;
   }
   document.title = (t.title||t.path) + " — Music";
 }
@@ -816,7 +938,6 @@ function highlightPlaying(globalIdx) {
     const idx = parseInt(el.dataset.idx);
     el.classList.toggle("playing", idx === globalIdx);
   });
-  // scroll into view
   const el = document.querySelector(`.tr[data-idx="${globalIdx}"]`);
   if (el) el.scrollIntoView({ block:"nearest", behavior:"smooth" });
 }
@@ -838,7 +959,203 @@ function playPrev() {
   playTrack(QUEUE[QUEUE_POS]);
 }
 
-// navigation
+// Insert tracks right after the current queue position (or start playing if idle)
+function queueNext(idxs) {
+  if (!idxs.length) return;
+  if (!QUEUE.length) {
+    QUEUE = [...idxs]; QUEUE_POS = 0;
+    playTrack(QUEUE[0]);
+  } else {
+    QUEUE.splice(QUEUE_POS+1, 0, ...idxs);
+    toast(`${idxs.length} track${idxs.length===1?"":"s"} will play next`);
+  }
+  updateQueueInfo();
+}
+
+function queueAppend(idxs) {
+  if (!idxs.length) return;
+  if (!QUEUE.length) {
+    QUEUE = [...idxs]; QUEUE_POS = 0;
+    playTrack(QUEUE[0]);
+  } else {
+    QUEUE.push(...idxs);
+    toast(`${idxs.length} track${idxs.length===1?"":"s"} added to queue`);
+  }
+  updateQueueInfo();
+}
+
+function playFolder(folder) {
+  const idxs = folderTrackIdxs(folder);
+  if (!idxs.length) return;
+  QUEUE = idxs; QUEUE_POS = 0;
+  if (SHUFFLED) shuffleQueue(0);
+  playTrack(QUEUE[QUEUE_POS]);
+}
+
+function removeFromQueue(globalIdx) {
+  const pos = QUEUE.indexOf(globalIdx);
+  if (pos < 0 || pos === QUEUE_POS) return;
+  QUEUE.splice(pos, 1);
+  if (pos < QUEUE_POS) QUEUE_POS--;
+  updateQueueInfo();
+  toast("Removed from queue");
+}
+
+// ── Download / clipboard ──────────────────────────────────────────────────
+function downloadTrack(t) {
+  const a = document.createElement("a");
+  a.href = encPath(t.path);
+  a.download = t.path.split("/").pop();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function copyText(text) {
+  const done = () => toast("Copied to clipboard");
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => copyFallback(text) && done());
+  } else if (copyFallback(text)) done();
+}
+function copyFallback(text) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch(_){}
+  ta.remove();
+  return ok;
+}
+
+// ── Context menu ──────────────────────────────────────────────────────────
+let ctxActions = [];
+function showMenu(x, y, items) {
+  ctxActions = items;
+  ctxEl.innerHTML = items.map((it, i) =>
+    it.sep ? `<div class="cm-sep"></div>`
+           : `<div class="cm-item" data-i="${i}"><span class="cm-ico">${it.ico||""}</span>${esc(it.label)}</div>`
+  ).join("");
+  ctxEl.classList.add("open");
+  const r = ctxEl.getBoundingClientRect();
+  ctxEl.style.left = Math.min(x, innerWidth  - r.width  - 6) + "px";
+  ctxEl.style.top  = Math.min(y, innerHeight - r.height - 6) + "px";
+}
+function hideMenu() { ctxEl.classList.remove("open"); }
+
+ctxEl.addEventListener("click", e => {
+  const item = e.target.closest(".cm-item");
+  if (!item) return;
+  hideMenu();
+  const act = ctxActions[parseInt(item.dataset.i)];
+  if (act && act.fn) act.fn();
+});
+document.addEventListener("click", e => { if (!ctxEl.contains(e.target)) hideMenu(); });
+window.addEventListener("blur", hideMenu);
+document.addEventListener("scroll", hideMenu, true);
+
+function trackMenuItems(idx) {
+  const t = ALL_TRACKS[idx];
+  const isCurrent = QUEUE[QUEUE_POS] === idx;
+  const items = [];
+  if (isCurrent) {
+    items.push({ ico: audio.paused ? "▶" : "⏸",
+                 label: audio.paused ? "Play" : "Pause",
+                 fn: () => audio.paused ? audio.play() : audio.pause() });
+  } else {
+    items.push({ ico: "▶", label: "Play", fn: () => { buildQueue(idx); playTrack(idx); } });
+    items.push({ ico: "⏭", label: "Play next",   fn: () => queueNext([idx]) });
+    items.push({ ico: "＋", label: "Add to queue", fn: () => queueAppend([idx]) });
+    if (QUEUE.includes(idx))
+      items.push({ ico: "－", label: "Remove from queue", fn: () => removeFromQueue(idx) });
+  }
+  items.push({ ico: "📁", label: "Play folder", fn: () => playFolder(t.folder) });
+  items.push({ sep: true });
+  items.push({ ico: "⬇", label: "Download", fn: () => downloadTrack(t) });
+  items.push({ ico: "⧉", label: "Copy file path", fn: () => copyText(t.path) });
+  items.push({ ico: "ℹ", label: "Track info", fn: () => showTrackInfo(idx) });
+  return items;
+}
+
+function folderMenuItems(folder) {
+  return [
+    { ico: "▶", label: "Play folder",  fn: () => playFolder(folder) },
+    { ico: "⏭", label: "Play next",    fn: () => queueNext(folderTrackIdxs(folder)) },
+    { ico: "＋", label: "Add to queue", fn: () => queueAppend(folderTrackIdxs(folder)) },
+    { sep: true },
+    { ico: "⧉", label: "Copy folder path", fn: () => copyText(folder) },
+  ];
+}
+
+$("tracklist").addEventListener("contextmenu", e => {
+  const tr = e.target.closest(".tr");
+  const ah = e.target.closest(".album-h");
+  if (!tr && !ah) return;
+  e.preventDefault();
+  showMenu(e.clientX, e.clientY,
+    tr ? trackMenuItems(parseInt(tr.dataset.idx))
+       : folderMenuItems(ah.dataset.folder));
+});
+
+treeEl.addEventListener("contextmenu", e => {
+  const tn = e.target.closest(".tn");
+  if (!tn) return;
+  e.preventDefault();
+  showMenu(e.clientX, e.clientY, folderMenuItems(tn.dataset.path));
+});
+
+// ── Track info modal ──────────────────────────────────────────────────────
+function showTrackInfo(idx) {
+  const t = ALL_TRACKS[idx];
+  const art = artOf(t);
+  $("modal-head").innerHTML = `
+    <div class="mh-art">${art ? `<img src="${esc(encPath(art))}" alt="">` : "♪"}</div>
+    <div>
+      <div class="mh-title">${esc(t.title || t.path)}</div>
+      <div class="mh-sub">${esc([t.artist, t.album].filter(Boolean).join(" — "))}</div>
+    </div>
+    <button id="modal-close" title="Close">✕</button>`;
+  const rows = [
+    ["Title", t.title], ["Artist", t.artist], ["Album", t.album],
+    ["Album artist", t.albumArtist], ["Track", t.track || ""], ["Disc", t.disc || ""],
+    ["Year", t.year], ["Genre", t.genre], ["Duration", fmt(t.duration)],
+    ["File", t.path],
+  ].filter(([,v]) => v !== "" && v !== null && v !== undefined);
+  $("modal-body").innerHTML = rows.map(([k,v]) =>
+    `<div class="mi-row"><div class="mi-k">${k}</div><div class="mi-v">${esc(v)}</div></div>`
+  ).join("");
+  $("modal-overlay").classList.add("open");
+  $("modal-close").addEventListener("click", hideModal);
+}
+function hideModal() { $("modal-overlay").classList.remove("open"); }
+$("modal-cancel").addEventListener("click", hideModal);
+$("modal-overlay").addEventListener("click", e => { if (e.target === $("modal-overlay")) hideModal(); });
+
+// ── Art hover preview ─────────────────────────────────────────────────────
+const previewEl  = $("artpreview");
+const previewImg = previewEl.querySelector("img");
+document.addEventListener("mouseover", e => {
+  const el = e.target.closest("[data-art]");
+  if (!el) return;
+  previewImg.src = el.dataset.art;
+  previewEl.style.display = "block";
+  const r = el.getBoundingClientRect();
+  requestAnimationFrame(() => {
+    const pw = previewEl.offsetWidth, ph = previewEl.offsetHeight;
+    let x = r.right + 10, y = r.top;
+    if (x + pw > innerWidth  - 8) x = Math.max(8, r.left - pw - 10);
+    if (y + ph > innerHeight - 8) y = Math.max(8, innerHeight - ph - 8);
+    previewEl.style.left = x + "px";
+    previewEl.style.top  = y + "px";
+  });
+});
+document.addEventListener("mouseout", e => {
+  if (e.target.closest && e.target.closest("[data-art]"))
+    previewEl.style.display = "none";
+});
+
+// ── Transport controls ────────────────────────────────────────────────────
 $("btn-play").addEventListener("click", () => {
   if (audio.paused) audio.play(); else audio.pause();
 });
@@ -857,13 +1174,13 @@ $("btn-shuffle").addEventListener("click", () => {
 });
 $("btn-shuffle-all").addEventListener("click", () => {
   ACTIVE_FOLDER = null;
-  VIEW_TRACKS = [...ALL_TRACKS];
+  VIEW = ALL_TRACKS.map((_, i) => i);
   buildQueue(0);
   SHUFFLED = true;
   shuffleQueue();
   $("btn-shuffle").classList.add("active");
   playTrack(QUEUE[0]);
-  renderTracks(VIEW_TRACKS, "");
+  renderTracks(VIEW, "");
   $("settingspop").classList.remove("open");
 });
 
@@ -887,6 +1204,10 @@ volEl.addEventListener("input", () => { audio.volume = volEl.value; });
 
 // Keyboard shortcuts
 document.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    if ($("modal-overlay").classList.contains("open")) { hideModal(); return; }
+    if (ctxEl.classList.contains("open")) { hideMenu(); return; }
+  }
   if (e.target.tagName === "INPUT") return;
   if (e.code === "Space")      { e.preventDefault(); audio.paused?audio.play():audio.pause(); }
   if (e.code === "ArrowRight") { audio.currentTime = Math.min(audio.duration||0, audio.currentTime+5); }
@@ -915,12 +1236,7 @@ treeEl.addEventListener("click", e => {
   document.querySelectorAll(".tn").forEach(n => n.classList.remove("active"));
   tn.classList.add("active");
   ACTIVE_FOLDER = path;
-
-  VIEW_TRACKS = ALL_TRACKS.filter(t =>
-    t.folder === path || t.folder.startsWith(path+"/")
-  );
-  renderTracks(VIEW_TRACKS, searchEl.value.trim());
-  statsEl.textContent = `${VIEW_TRACKS.length} tracks`;
+  doSearch(searchEl.value);
 });
 
 // Show all on logo click
@@ -928,16 +1244,20 @@ $("logo").style.cursor = "pointer";
 $("logo").addEventListener("click", () => {
   document.querySelectorAll(".tn").forEach(n => n.classList.remove("active"));
   ACTIVE_FOLDER = null;
-  VIEW_TRACKS = ALL_TRACKS;
-  renderTracks(ALL_TRACKS, "");
-  statsEl.textContent = `${ALL_TRACKS.length} tracks`;
+  searchEl.value = "";
+  doSearch("");
 });
 
-// ── Track click → play ────────────────────────────────────────────────────
+// ── Track click → play / pause toggle ─────────────────────────────────────
 tracksEl.addEventListener("click", e => {
   const tr = e.target.closest(".tr");
   if (!tr) return;
   const idx = parseInt(tr.dataset.idx);
+  if (QUEUE[QUEUE_POS] === idx) {
+    // Clicking the current track toggles pause instead of restarting
+    if (audio.paused) audio.play(); else audio.pause();
+    return;
+  }
   buildQueue(idx);
   playTrack(idx);
 });
@@ -964,7 +1284,27 @@ $("btn-clear-idb").addEventListener("click", async () => {
   await clearIDB();
   idbStatus.textContent = "IDB cleared. Reload the page to re-read audiodata.js.";
 });
-$("btn-reload").addEventListener("click", () => location.reload(true));
+$("btn-reload").addEventListener("click", () => location.reload());
+
+// ── Font size setting (rem-based UI scale, persisted) ────────────────────
+const FS_MIN = 11, FS_MAX = 18, FS_DEF = 14;
+let fontSize = FS_DEF;
+try {
+  const saved = parseInt(localStorage.getItem("fontSize"));
+  if (!isNaN(saved)) fontSize = Math.min(FS_MAX, Math.max(FS_MIN, saved));
+} catch(_){}
+function applyFontSize() {
+  document.documentElement.style.fontSize = fontSize + "px";
+  $("fs-val").textContent = fontSize + "px";
+  try { localStorage.setItem("fontSize", fontSize); } catch(_){}
+}
+$("fs-minus").addEventListener("click", () => {
+  if (fontSize > FS_MIN) { fontSize--; applyFontSize(); }
+});
+$("fs-plus").addEventListener("click", () => {
+  if (fontSize < FS_MAX) { fontSize++; applyFontSize(); }
+});
+applyFontSize();
 
 // ── Resizer ───────────────────────────────────────────────────────────────
 (function() {
@@ -997,7 +1337,7 @@ function init() {
     return (a.title||"").localeCompare(b.title||"");
   });
 
-  VIEW_TRACKS = [...ALL_TRACKS];
+  VIEW = ALL_TRACKS.map((_, i) => i);
   statsEl.textContent = `${ALL_TRACKS.length} tracks`;
 
   // Build & render tree
@@ -1014,7 +1354,7 @@ function init() {
     });
   }
 
-  renderTracks(ALL_TRACKS, "");
+  renderTracks(VIEW, "");
 
   // Restore last track highlight (not auto-play, user must click)
   try {
@@ -1051,8 +1391,6 @@ def main():
 
     if not HAS_MUTAGEN:
         print("❌  mutagen not installed — tags will be minimal. Run: pip install mutagen")
-    if not args.no_art and not HAS_PIL:
-        print("❌  Pillow not installed — art will be read raw (no resize). Run: pip install Pillow")
 
     print(f"Root   : {root}")
     print(f"Output : {out_dir}")
@@ -1060,11 +1398,11 @@ def main():
         print(f"Exclude: {', '.join(args.exclude)}")
 
     # Scan
-    tracks = scan(root, args)
+    tracks, folder_art = scan(root, args)
     if not tracks and not args.force_rescan:
         sys.exit(0)
 
-    write_datafile(tracks, out_dir, root)
+    write_datafile(tracks, folder_art, out_dir, root)
 
     # Write HTML (unless --no-html)
     if not args.no_html:
