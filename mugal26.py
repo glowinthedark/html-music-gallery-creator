@@ -1287,7 +1287,7 @@ $("btn-clear-idb").addEventListener("click", async () => {
 $("btn-reload").addEventListener("click", () => location.reload());
 
 // ── Font size setting (rem-based UI scale, persisted) ────────────────────
-const FS_MIN = 11, FS_MAX = 18, FS_DEF = 14;
+const FS_MIN = 9, FS_MAX = 24, FS_DEF = 15;
 let fontSize = FS_DEF;
 try {
   const saved = parseInt(localStorage.getItem("fontSize"));
