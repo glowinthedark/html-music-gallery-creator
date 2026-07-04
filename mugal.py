@@ -72,6 +72,10 @@ def parse_args():
         help="Skip tracks shorter than this many seconds"
     )
     p.add_argument(
+        "--extract-template", "-x", action="store_true",
+        help="Dump the embedded HTML template"
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true",
         help="Print each scanned file"
     )
@@ -1390,6 +1394,11 @@ def main():
 
     out_dir = Path(args.output).resolve() if args.output else root
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.extract_template:
+        print("Dumping HTML template only, skipping media scan.")
+        write_html(out_dir)
+        sys.exit(0)
 
     if not HAS_MUTAGEN:
         print("❌  mutagen not installed — tags will be minimal. Run: pip install mutagen")
