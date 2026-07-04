@@ -637,6 +637,8 @@ const esc = s => String(s).replace(/[&<>"']/g, c =>
 
 // Encode a relative path for use as a URL (handles #, ?, brackets…)
 const encPath = p => p.split("/").map(encodeURIComponent).join("/");
+// Absolute URL of a relative path — works over both http(s):// and file://
+const fullURL = p => new URL(encPath(p), location.href).href;
 
 const artOf = t => FOLDER_ART[t.folder] || null;
 
@@ -1073,7 +1075,7 @@ function trackMenuItems(idx) {
   items.push({ ico: "📁", label: "Play folder", fn: () => playFolder(t.folder) });
   items.push({ sep: true });
   items.push({ ico: "⬇", label: "Download", fn: () => downloadTrack(t) });
-  items.push({ ico: "⧉", label: "Copy file path", fn: () => copyText(t.path) });
+  items.push({ ico: "⧉", label: "Copy file URL", fn: () => copyText(fullURL(t.path)) });
   items.push({ ico: "ℹ", label: "Track info", fn: () => showTrackInfo(idx) });
   return items;
 }
@@ -1084,7 +1086,7 @@ function folderMenuItems(folder) {
     { ico: "⏭", label: "Play next",    fn: () => queueNext(folderTrackIdxs(folder)) },
     { ico: "＋", label: "Add to queue", fn: () => queueAppend(folderTrackIdxs(folder)) },
     { sep: true },
-    { ico: "⧉", label: "Copy folder path", fn: () => copyText(folder) },
+    { ico: "⧉", label: "Copy folder URL", fn: () => copyText(fullURL(folder) + "/") },
   ];
 }
 
@@ -1287,7 +1289,7 @@ $("btn-clear-idb").addEventListener("click", async () => {
 $("btn-reload").addEventListener("click", () => location.reload());
 
 // ── Font size setting (rem-based UI scale, persisted) ────────────────────
-const FS_MIN = 11, FS_MAX = 18, FS_DEF = 14;
+const FS_MIN = 11, FS_MAX = 24, FS_DEF = 14;
 let fontSize = FS_DEF;
 try {
   const saved = parseInt(localStorage.getItem("fontSize"));

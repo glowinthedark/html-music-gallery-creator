@@ -1,48 +1,98 @@
-# HTML music library generator script
+# HTML Music Gallery Creator
 
-Python script to create an HTML audio library file listing in a flat page all the media files under a given folder (current folder by default).
+A Python script that generates a self-contained, zero-dependency HTML audio player from a local music library. Works directly from `file://` URLs — no server required.
+
+![](music-gallery-screen.png)
+
+## Features
+
+### Player Interface
+- **Dark-themed UI** with resizable sidebar for library navigation
+- **Track list** with title, artist, album, and duration columns
+- **Album art** display in headers and now-playing bar (extracted from embedded tags or cover files)
+- **Search** across tracks (title, artist, album, folder)
+- **Playback controls**: play/pause, previous, next, seek scrubber, volume
+- **Repeat modes**: off / all / one track
+- **Shuffle** toggle for randomized playback
+- **Queue management** via context menu (play next, add to queue, remove)
+
+### Context Menus
+Right-click tracks or folders for:
+- Play / Play next / Add to queue
+- Download track / Copy file URL
+- Play folder / Copy folder URL
+- View track info (full metadata)
+
+### Performance
+- **IndexedDB caching** for libraries >300 tracks
+- **Lazy rendering** (200 tracks per chunk)
+- **Album art hover preview** on headers
+
+### Settings
+- Font size adjustment (persisted)
+- Reload data / Clear cache buttons
+- Shuffle all library button
+
+### Keyboard Shortcuts
+- <kbd>Space</kbd> — Play/pause
+- <kbd>N</kbd> / <kbd>P</kbd> — Next / Previous
+- <kbd>F</kbd> — Focus search
+- <kbd>←</kbd> / <kbd>→</kbd> — Seek -5s / +5s
+- <kbd>↑</kbd> / <kbd>↓</kbd> — Volume up / down
+- <kbd>Esc</kbd> — Close modals
 
 ## Usage
 
-Generate an HTML library with all audio files under the current folder. The default file name is `mu.html` in the target folder:
+```bash
+python mugal26.py [ROOT] [options]
+```
+
+- `ROOT` defaults to current directory
+
+### Options
+
+```
+-o, --output       Output folder for index.html + audiodata.js
+--no-art           Skip album art extraction
+--force-rescan     Ignore cached state
+--exclude PATTERN    Glob pattern to exclude (repeatable)
+--no-html          Only generate audiodata.js
+--min-duration SEC Skip tracks shorter than SEC seconds
+-v, --verbose      Print each scanned file
+```
+
+### Examples
 
 ```bash
-mugal26.py
+# Scan current folder
+python mugal26.py
+
+# Scan specific folder with exclusions
+python mugal26.py ~/Music --exclude '*.wav' --exclude 'Podcasts/*'
+
+# Skip short tracks and output elsewhere
+python mugal26.py ~/Music --output ~/output --min-duration 30
 ```
 
-Generate a library file for a custom folder including video files, skipping folder names containing `testing` and `unsorted` (the index will be created under `~/Music/music.html`):
+## Output Files
 
-```bash
-mugal26.py ~/Music --verbose --output-file music.html
-```
+- `index.html` — Self-contained player (no external dependencies)
+- `audiodata.js` — JSON track data with cover art references
 
-## Screenshots
+## Requirements
 
-![](mu.png)
+- **Python 3.9+**
+- **mutagen** (optional, for full metadata/tags): `pip install mutagen`
 
-## Command line flags
+### Supported Audio Formats
 
-For commmand line usage run `music-gallery-creator.py -h`:
+`.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.aac`, `.wav`, `.webm`
 
-```bash            
-usage: mugal26.py [-h] [--output-file output_file] [--videos] [--ignored [ignore ...]]
-                [--follow_symlinks] [--verbose]
-                [gallery_root]
+Without mutagen, title defaults to filename and tags are minimal.
 
-Music gallery Generator
+## How It Works
 
-positional arguments:
-  gallery_root          Gallery root, by default current folder (.)
-
-options:
-  -h, --help            show this help message and exit
-  --output-file, -o output_file
-                        Output filename (mu.html)
-  --videos, -m          Include videos
-  --ignored, -i [ignore ...]
-                        Custom ignored path segments. Accepts multiple segments, e.g. -i junk1
-                        junk2 junk3 ([])
-  --follow_symlinks, -f
-                        Follow symlinks (False)
-  --verbose, -v         Verbose output (False)
-```
+1. **Scan**: Recursively finds all audio files in the root folder
+2. **Extract**: Reads metadata (title, artist, album, year, genre, track/disc numbers, duration) from file tags using mutagen
+3. **Art**: Finds or extracts album cover art (cover.jpg, folder.png, etc. or embedded APIC/covr pictures)
+4. **Generate**: Creates `audiodata.js` with JSON track data and `index.html` with embedded CSS/JS player
