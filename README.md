@@ -2,13 +2,13 @@
 
 A Python script that generates a self-contained, zero-dependency HTML audio player from a local music library. Works directly from `file://` URLs — no server required.
 
-![](music-gallery-screen.png)
+![](mu.png)
 
 ## Features
 
 ### Player Interface
 - **Dark-themed UI** with resizable sidebar for library navigation
-- **Track list** with title, artist, album, and duration columns
+- **Track list** with title, artist, album, etc
 - **Album art** display in headers and now-playing bar (extracted from embedded tags or cover files)
 - **Search** across tracks (title, artist, album, folder)
 - **Playback controls**: play/pause, previous, next, seek scrubber, volume
@@ -17,21 +17,20 @@ A Python script that generates a self-contained, zero-dependency HTML audio play
 - **Queue management** via context menu (play next, add to queue, remove)
 
 ### Context Menus
-Right-click tracks or folders for:
+Right-click tracks or folders to:
 - Play / Play next / Add to queue
-- Download track / Copy file URL
+- Download / Copy file URL
 - Play folder / Copy folder URL
 - View track info (full metadata)
 
 ### Performance
 - **IndexedDB caching** for libraries >300 tracks
 - **Lazy rendering** (200 tracks per chunk)
-- **Album art hover preview** on headers
 
 ### Settings
-- Font size adjustment (persisted)
+- Font size adjustment (click ⚙️)
 - Reload data / Clear cache buttons
-- Shuffle all library button
+- Shuffle library
 
 ### Keyboard Shortcuts
 - <kbd>Space</kbd> — Play/pause
@@ -44,7 +43,7 @@ Right-click tracks or folders for:
 ## Usage
 
 ```bash
-python mugal26.py [ROOT] [options]
+python mugal.py [ROOT] [options]
 ```
 
 - `ROOT` defaults to current directory
@@ -65,13 +64,13 @@ python mugal26.py [ROOT] [options]
 
 ```bash
 # Scan current folder
-python mugal26.py
+python mugal.py
 
 # Scan specific folder with exclusions
-python mugal26.py ~/Music --exclude '*.wav' --exclude 'Podcasts/*'
+python mugal.py ~/Music --exclude '*.wav' --exclude 'Podcasts/*'
 
 # Skip short tracks and output elsewhere
-python mugal26.py ~/Music --output ~/output --min-duration 30
+python mugal.py ~/Music --output ~/output --min-duration 30
 ```
 
 ## Output Files
@@ -82,7 +81,7 @@ python mugal26.py ~/Music --output ~/output --min-duration 30
 ## Requirements
 
 - **Python 3.9+**
-- **mutagen** (optional, for full metadata/tags): `pip install mutagen`
+- **[`mutagen`](https://github.com/quodlibet/mutagen)** (optional, for full metadata/tags): `pip install mutagen`
 
 ### Supported Audio Formats
 
@@ -92,7 +91,7 @@ Without mutagen, title defaults to filename and tags are minimal.
 
 ## How It Works
 
-1. **Scan**: Recursively finds all audio files in the root folder
-2. **Extract**: Reads metadata (title, artist, album, year, genre, track/disc numbers, duration) from file tags using mutagen
-3. **Art**: Finds or extracts album cover art (cover.jpg, folder.png, etc. or embedded APIC/covr pictures)
-4. **Generate**: Creates `audiodata.js` with JSON track data and `index.html` with embedded CSS/JS player
+1. Recursively finds all audio files in the root folder
+2. Reads metadata (title, artist, album, year, genre, track/disc numbers, duration) from file tags using mutagen
+3. Finds album cover art (cover.jpg, folder.png, etc. or embedded APIC/covr pictures)
+4. Creates `audiodata.js` with JSON track data and `index.html` with embedded CSS/JS player
