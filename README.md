@@ -23,6 +23,8 @@ A Python script that turns a local music library into a zero-dependency HTML aud
 ### Context menus
 Right-click (or the ⋯ button) on tracks, album headers, folders, Queue and Favorites: play, shuffle, play next, add to queue, favorite, go to folder, copy link / file URL, download, track info, save as `.m3u`.
 
+Clicking an album header plays that folder and keeps your place in the list; open the folder from its menu (*Open folder*) or the sidebar.
+
 ### Keyboard shortcuts
 | Key | Action | Key | Action |
 |---|---|---|---|

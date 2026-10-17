@@ -137,7 +137,8 @@ mark{background:none;color:var(--accent)}
 .ah-name{font-size:.9286rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ah-meta{font-size:.7143rem;color:var(--text3);font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ah-play{width:2rem;height:2rem;border-radius:50%;border:0;background:var(--accent);color:#16110A;cursor:pointer;opacity:0;flex-shrink:0;font-size:.8rem}
-.album-h:hover .ah-play,.ah-play:focus-visible{opacity:1}
+.ah-more{width:1.6rem;flex-shrink:0}
+.album-h:hover .ah-play,.ah-play:focus-visible,.album-h:hover .t-act{opacity:1}
 @media (hover:none){.ah-play{opacity:.9}}
 
 .q-sec{display:flex;align-items:flex-end;gap:8px;height:var(--sec-h);padding:0 18px 6px;font-size:.7143rem;color:var(--text3);text-transform:uppercase;letter-spacing:.08em;overflow:hidden;white-space:nowrap}
@@ -710,7 +711,8 @@ function folderRow(fi) {
   return `<div class="album-h" data-fi="${fi}" draggable="true" title="${esc(f || "Loose tracks")}">`
     + `<div class="ah-art"${art ? ` data-art="${esc(art)}"` : ""}>${art ? `<img src="${esc(art)}" loading="lazy" decoding="async" alt="">` : "♪"}</div>`
     + `<div class="ah-text"><div class="ah-name">${hl(name)}</div><div class="ah-meta">${esc(parent)}${plural(h[0], "track")} · ${fmtLong(h[1])}</div></div>`
-    + `<button class="ah-play" data-act="playfolder" title="Play folder" aria-label="Play folder">▶</button></div>`;
+    + `<button class="ah-play" data-act="playfolder" title="Play folder" aria-label="Play folder">▶</button>`
+    + `<button class="t-act ah-more" data-act="more" title="More (Open folder …)" aria-label="More actions">⋯</button></div>`;
 }
 const secHTML = (label, extra = "", attr = "") => `<div class="q-sec"${attr}>${label}${extra}</div>`;
 
@@ -1099,16 +1101,17 @@ rowsEl.addEventListener("click", e => {
   const act = e.target.closest("[data-act]"), tr = e.target.closest(".tr"), ah = e.target.closest(".album-h");
   const a = act?.dataset.act;
   if (a === "clearup") return clearUp();
-  if (ah) {
-    const f = FOLDERS[+ah.dataset.fi];
-    if (a === "playfolder") return playNode(NODE_BY_PATH.get(f), false);
-    return navigate({ v: "lib", f });
+  if (ah) {                                                    // whole header plays, like its ▶; opening is in the menu
+    const n = FNODE[+ah.dataset.fi];
+    if (a === "more") { const r = act.getBoundingClientRect(); return showMenu(r.right, r.bottom, nodeMenu(n, true), act); }
+    return e.detail > 1 ? undefined : playNode(n, false);     // a double-click must not restart the folder
   }
   if (!tr) return;
   const i = +tr.dataset.i, role = tr.dataset.role || "", q = +tr.dataset.q;
   if (a === "fav") return toggleFav(i);
   if (a === "rm") return removeUp(q);
   if (a === "more") { const r = act.getBoundingClientRect(); return showMenu(r.right, r.bottom, trackMenu(i, role, q), act); }
+  if (e.detail > 1) return;                                    // a double-click must not play-then-pause
   playFromRow(i, role, q);
 });
 $("viewbar").addEventListener("click", e => {
@@ -1218,9 +1221,12 @@ function trackMenu(i, role, q) {
   items.push({ ico: "ℹ", label: "Track info", fn: () => showInfo(i) });
   return items;
 }
-function nodeMenu(n) {
+function nodeMenu(n, header) {
   const all = () => range(n.start, n.end);
+  const here = ROUTE.v === "lib" && ROUTE.f === n.path && !ROUTE.q;
   return [
+    header && !here ? { ico: "📁", label: "Open folder", fn: () => navigate({ v: "lib", f: n.path }) } : null,
+    header && !here ? { sep: true } : null,
     { ico: "▶", label: "Play", fn: () => playNode(n, false) },
     { ico: ICON.shuffle, label: "Shuffle", fn: () => playNode(n, true) },
     { ico: "⏭", label: "Play next", fn: () => queueNext(all()) },
@@ -1248,7 +1254,7 @@ document.addEventListener("contextmenu", e => {
   const tn = e.target.closest?.("#tree .tn"), nv = e.target.closest?.(".nv");
   let items = null;
   if (tr) items = trackMenu(+tr.dataset.i, tr.dataset.role || "", +tr.dataset.q);
-  else if (ah) items = nodeMenu(NODE_BY_PATH.get(FOLDERS[+ah.dataset.fi]));
+  else if (ah) items = nodeMenu(FNODE[+ah.dataset.fi], true);
   else if (tn) items = nodeMenu(NODES[+tn.dataset.n]);
   else if (nv) items = navMenu(nv.dataset.nav);
   else if (e.target.closest?.("#np-info, #np-art") && CUR >= 0) items = trackMenu(CUR, "", -1);
