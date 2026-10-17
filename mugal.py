@@ -1,1427 +1,1002 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["mutagen>=1.47", "enzyme>=0.5"]
+# ///
 """
-VERSION: 14.0611.22
-scan_music.py — Local music library scanner
-Generates audiodata.js + index.html for file:// playback.
+mugal — scan a local music library and generate a browser player.
+
+Writes audiodata.js (track metadata) and index.html (the player) into the
+output folder. Open index.html straight from disk (file://); no server needed.
 
 Usage:
-    python scan_music.py [ROOT] [options]
+    python mugal.py [ROOT] [options]
+    uv run mugal.py [ROOT] [options]     # installs mutagen + enzyme automatically
 
-    ROOT defaults to the current working directory.
+ROOT defaults to the current working directory.
+
+Examples:
+    python mugal.py ~/Music
+    python mugal.py ~/Music --exclude Podcasts --exclude '*.wav'
+    python mugal.py /Volumes/NAS/Music -o ~/player --min-duration 30
+    python mugal.py ~/Music --serve            # debug over http://localhost:8000
 """
 
+from __future__ import annotations
+
 import argparse
+import base64
+import contextlib
+import errno
 import fnmatch
+import functools
+import gc
 import hashlib
+import importlib
+import importlib.util
+import itertools
 import json
+import math
+import os
 import re
+import site
+import stat
 import sys
+import sysconfig
+import tempfile
 import time
+import unicodedata
 import webbrowser
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-# deps
 try:
+    import mutagen
     from mutagen import File as MutagenFile
-    HAS_MUTAGEN = True
 except ImportError:
-    HAS_MUTAGEN = False
+    mutagen = MutagenFile = None
+
+
+def _load_enzyme():
+    try:
+        mod = importlib.import_module("enzyme")
+    except ImportError:
+        return None
+    # enzyme re-parses its bundled Matroska spec XML on every file (~15 ms each); parse it once
+    with contextlib.suppress(Exception):
+        ebml = importlib.import_module("enzyme.parsers.ebml")
+        ebml.get_matroska_specs = functools.lru_cache(maxsize=None)(ebml.get_matroska_specs)
+    return mod
+
+
+enzyme = _load_enzyme()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".webm"}
-ART_NAMES  = {"cover", "folder", "album", "front", "artwork", "art"}
-ART_EXTS   = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
-MIME_EXT   = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
-              "image/webp": ".webp", "image/gif": ".gif"}
+VERSION    = "14.0925.17"
+SCHEMA     = 2        # audiodata.js layout; player.html refuses other versions
+CACHE_VER  = 2        # bump whenever tag extraction changes → one full rescan
+AUDIO_EXTS = frozenset({".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".webm"})
+MATROSKA   = frozenset({".webm"})
+ART_EXTS   = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
+# Cover file names in priority order; whole words only ("heart.jpg" is not "art")
+ART_RES    = tuple(re.compile(p) for p in (
+    r"(?<![a-z])cover(?![a-z])", r"(?<![a-z])folder(?![a-z])", r"(?<![a-z])front(?![a-z])",
+    r"(?<![a-z])albumart",       r"(?<![a-z])album(?![a-z])",  r"(?<![a-z])artwork(?![a-z])",
+    r"(?<![a-z])art(?![a-z])",
+))
 DATAFILE   = "audiodata.js"
 HTMLFILE   = "index.html"
+TEMPLATE   = Path(__file__).resolve().with_name("player.html")
+STATE_DIR  = ".mugal"                       # cache, report, fallback covers (inside OUTPUT)
+MARKERS    = ('<meta name="generator" content="mugal"', "MUSIC PLAYER — file:// compatible")
+FIELDS     = ("title", "artist", "album", "albumArtist", "track", "disc", "year", "genre", "duration", "art")
+EMPTY_REC  = ("", "", "", "", 0, 0, 0, "", 0.0, 0)
+
+# Default skips (disable with --all). Dot-prefixed names are always skipped too.
+SKIP_DIRS = frozenset(n.casefold() for n in (
+    # macOS
+    ".Trashes", ".Spotlight-V100", ".fseventsd", ".DocumentRevisions-V100", ".TemporaryItems",
+    ".AppleDouble", ".AppleDB", ".AppleDesktop", "Network Trash Folder", "Temporary Items",
+    # Windows
+    "$RECYCLE.BIN", "RECYCLER", "RECYCLED", "System Volume Information", "$WINDOWS.~BT",
+    # Linux
+    "lost+found",
+    # NAS: Synology, QNAP, NetApp
+    "@eaDir", "#recycle", "#snapshot", "@Recycle", "@Recently-Snapshot", "@__thumb", ".snapshot",
+))
+SKIP_SUFFIXES   = (".photoslibrary", ".musiclibrary", ".tvlibrary", ".app", ".bundle")  # macOS packages
+ANDROID_PRIVATE = frozenset({("android", "data"), ("android", "obb")})                 # (parent, name)
+NOMEDIA         = ".nomedia"                                                           # Android: skip folder
+_WIN_HIDDEN     = (stat.FILE_ATTRIBUTE_HIDDEN | stat.FILE_ATTRIBUTE_SYSTEM) if os.name == "nt" else 0
+
+
+# ── Console ───────────────────────────────────────────────────────────────────
+def info(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def warn(msg: str) -> None:
+    print(f"⚠  {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg: str, code: int = 1):
+    print(f"✗ {msg}", file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def progress_bar(label: str, total: int = 0):
+    """Return tick(n, final=False): a throttled single-line progress display (TTY only)."""
+    tty, last = sys.stderr.isatty(), [0.0]
+
+    def tick(n: int, final: bool = False) -> None:
+        if not tty:
+            return
+        now = time.monotonic()
+        if not final and now - last[0] < 0.1:
+            return
+        last[0] = now
+        if total:
+            w = 30
+            f = w * n // total
+            sys.stderr.write(f"\r  {label} [{'█' * f}{'░' * (w - f)}] {n}/{total}")
+        else:
+            sys.stderr.write(f"\r  {label}… {n}")
+        sys.stderr.write("\n" if final else "")
+        sys.stderr.flush()
+
+    return tick
+
+
+def fmt_hours(sec: float) -> str:
+    return f"{sec / 3600:.0f} h" if sec >= 36000 else f"{sec / 3600:.1f} h" if sec >= 3600 else f"{sec / 60:.0f} min"
+
+
+def install_hint(*pkgs: str) -> list[str]:
+    exe = sys.executable or "python3"
+    exe = f'"{exe}"' if " " in exe else exe
+    names = " ".join(pkgs)
+    if os.environ.get("UV_RUN_RECURSION_DEPTH"):            # running under `uv run`: its env is throwaway
+        return ["   Install it by adding it to the uv command:",
+                f"     uv run --with {' --with '.join(pkgs)} {Path(__file__).name} …   (or plain `uv run {Path(__file__).name}`)"]
+    managed = sys.prefix == sys.base_prefix and Path(sysconfig.get_path("stdlib"), "EXTERNALLY-MANAGED").exists()
+    lines = ["   Install with one of:"]
+    if managed:
+        lines.append(f"     {exe} -m venv .venv && .venv/bin/pip install {names}   (this Python is externally managed)")
+    else:
+        lines.append(f"     {exe} -m pip install {names}")
+    lines.append(f"     uv run {Path(__file__).name} …   (installs everything listed in the script header)")
+    return lines
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
-def parse_args():
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Scan a music folder and generate a self-contained browser player.",
+        prog="mugal",
+        description="Scan a music folder and generate a browser player that works from file://.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog="Examples:" + __doc__.split("Examples:", 1)[1],
     )
-    p.add_argument(
-        "root", nargs="?", default=None,
-        help="Root music folder to scan (default: current folder)"
-    )
-    p.add_argument(
-        "-o", "--output", default=None,
-        help="Output folder for index.html + audiodata.js (default: same as ROOT)"
-    )
-    p.add_argument(
-        "--no-art", action="store_true",
-        help="Skip album art handling (no cover file lookup/extraction)"
-    )
-    p.add_argument(
-        "--force-rescan", action="store_true",
-        help="Ignore any cached state and re-scan all files"
-    )
-    p.add_argument(
-        "--exclude", action="append", default=[], metavar="PATTERN",
-        help="Glob pattern to exclude (can repeat). E.g. --exclude '*.wav' --exclude 'Podcasts/*'"
-    )
-    p.add_argument(
-        "--no-html", action="store_true",
-        help="Only regenerate audiodata.js, skip writing index.html"
-    )
-    p.add_argument(
-        "--min-duration", type=float, default=0, metavar="SEC",
-        help="Skip tracks shorter than this many seconds"
-    )
-    p.add_argument(
-        "--extract-template", "-x", action="store_true",
-        help="Dump the embedded HTML template"
-    )
-    p.add_argument(
-        "-v", "--verbose", action="store_true",
-        help="Print each scanned file"
-    )
-    return p.parse_args()
+    p.add_argument("root", nargs="?", help="music folder to scan (default: current folder)")
+    p.add_argument("-o", "--output", metavar="DIR", help="where index.html + audiodata.js go (default: ROOT)")
+    p.add_argument("--covers", metavar="DIR",
+                   help="save covers extracted from tags to DIR (default: cover.<ext> in each album folder, "
+                        f"or OUTPUT/{STATE_DIR}/covers when the folder is read-only)")
+    p.add_argument("--no-art", action="store_true", help="skip cover art entirely")
+    p.add_argument("--exclude", action="append", default=[], metavar="GLOB",
+                   help="skip files/folders matching GLOB, by path relative to ROOT or by name (repeatable)")
+    p.add_argument("--all", action="store_true",
+                   help="also scan hidden/system folders (.*, $RECYCLE.BIN, @eaDir, .nomedia, Android/data …)")
+    p.add_argument("--min-duration", type=float, default=0, metavar="SEC", help="skip tracks shorter than SEC seconds")
+    p.add_argument("--force-rescan", action="store_true", help="ignore the scan cache and re-read every file")
+    p.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
+                   help="parallel tag readers (default 0 = auto: threads only when reads are slow, e.g. NAS)")
+    p.add_argument("--no-html", action="store_true", help="only rewrite audiodata.js")
+    p.add_argument("-x", "--extract-template", action="store_true", help="only (re)write index.html, skip scanning")
+    p.add_argument("--force", action="store_true", help="overwrite an index.html that mugal didn't create")
+    p.add_argument("--no-open", action="store_true", help="don't open the browser when done")
+    p.add_argument("--serve", nargs="?", const="8000", metavar="[HOST:]PORT",
+                   help="serve the player over HTTP for debugging (default 127.0.0.1:8000; no seeking)")
+    p.add_argument("-v", "--verbose", action="store_true", help="list every file read and every file skipped")
+    p.add_argument("-V", "--version", action="version", version=f"mugal {VERSION}")
+    a = p.parse_args(argv)
+    if a.jobs < 0:
+        p.error("--jobs must be 0 (auto) or more")
+    if a.min_duration < 0 or not math.isfinite(a.min_duration):
+        p.error("--min-duration must be a non-negative number")
+    if a.serve is not None:
+        host, _, port = a.serve.rpartition(":")
+        try:
+            a.serve = (host.strip("[]") or "127.0.0.1", int(port))
+        except ValueError:
+            p.error(f"--serve expects PORT or HOST:PORT, got {a.serve!r}")
+        if not 0 <= a.serve[1] <= 65535:
+            p.error("--serve port must be 0–65535")
+    return a
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def is_excluded(path: Path, root: Path, patterns: list[str]) -> bool:
-    rel = str(path.relative_to(root)).replace("\\", "/")
-    return any(fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(path.name, pat)
-               for pat in patterns)
 
-def find_art(folder: Path) -> Path | None:
-    """Return the best cover image in folder, or None."""
-    candidates = []
-    for f in folder.iterdir():
-        if f.is_file() and f.suffix.lower() in ART_EXTS:
-            stem = f.stem.lower()
-            priority = next((i for i, n in enumerate(ART_NAMES) if n in stem), 99)
-            candidates.append((priority, f))
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
+# ── Filesystem walk ───────────────────────────────────────────────────────────
+def _hidden(entry: os.DirEntry) -> bool:
+    if entry.name.startswith("."):
+        return True
+    if _WIN_HIDDEN:
+        with contextlib.suppress(OSError):
+            return bool(entry.stat(follow_symlinks=False).st_file_attributes & _WIN_HIDDEN)
+    return False
+
+
+def _matches(rel: str, name: str, patterns: list[str], is_dir: bool = False) -> bool:
+    return any(fnmatch.fnmatch(rel, p) or fnmatch.fnmatch(name, p) or (is_dir and fnmatch.fnmatch(rel + "/", p))
+               for p in patterns)
+
+
+def _printable(rel: str) -> str:
+    return rel.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def walk(root: Path, excludes: list[str], everything: bool, problems: list, on_dir) -> list[tuple]:
+    """
+    Iterative scandir walk that prunes skipped/excluded folders before descending,
+    follows folder symlinks with loop detection and never raises on unreadable entries.
+    Returns [(rel_dir, abs_dir, [(name, size, mtime_ns)], [(image_name, size)])].
+    """
+    out, seen, stack = [], set(), [("", str(root))]
+    while stack:
+        rel, path = stack.pop()
+        try:
+            st = os.stat(path)
+            if st.st_ino:                                   # some network filesystems report 0
+                key = (st.st_dev, st.st_ino)
+                if key in seen:                             # symlink loop or already-visited target
+                    continue
+                seen.add(key)
+            with os.scandir(path) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except OSError as e:
+            problems.append((rel or ".", f"folder not readable ({e.strerror or e})"))
+            continue
+        if rel and not everything and any(e.name == NOMEDIA for e in entries):
+            continue
+        audio, images, subdirs = [], [], []
+        parent = rel.rpartition("/")[2].casefold()
+        for e in entries:
+            name = e.name
+            r = f"{rel}/{name}" if rel else name
+            if not everything and _hidden(e):
+                continue
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                problems.append((_printable(r), "name is not valid UTF-8 (rename it to include it)"))
+                continue
+            try:
+                if e.is_dir():
+                    cf = name.casefold()
+                    if not everything and (cf in SKIP_DIRS or cf.endswith(SKIP_SUFFIXES)
+                                           or (parent, cf) in ANDROID_PRIVATE):
+                        continue
+                    if not (excludes and _matches(r, name, excludes, True)):
+                        subdirs.append((r, e.path))
+                elif e.is_file():
+                    ext = os.path.splitext(name)[1].lower()
+                    if ext in AUDIO_EXTS:
+                        if not (excludes and _matches(r, name, excludes)):
+                            s = e.stat()
+                            audio.append((name, s.st_size, s.st_mtime_ns))
+                    elif ext in ART_EXTS:
+                        images.append((name, e.stat().st_size))
+            except OSError as ex:
+                problems.append((r, f"not readable ({ex.strerror or ex})"))
+        stack.extend(reversed(subdirs))
+        if audio or images:
+            out.append((rel, path, audio, images))
+            on_dir(len(audio))
+    return out
+
+
+# ── Tag reading ───────────────────────────────────────────────────────────────
+def _first(v) -> str:
+    """First value of a mutagen tag as clean text: ID3 frames, lists, MP4 (n, total) tuples, bytes."""
+    if v is None:
+        return ""
+    genres = getattr(v, "genres", None)                     # ID3 TCON resolves "(17)" → "Rock"
+    if genres is not None:
+        v = genres
+    elif hasattr(v, "text"):
+        v = v.text
+    if isinstance(v, list):
+        if not v:
+            return ""
+        v = v[0]
+    if isinstance(v, tuple):                                # MP4 trkn / disk
+        v = v[0] if v else ""
+    if isinstance(v, bytes):
+        v = v.decode("utf-8", "replace")
+    return str(v).replace("\x00", " ").strip()
+
+
+def _tag(tags, *keys: str) -> str:
+    for k in keys:
+        try:
+            v = _first(tags.get(k))
+        except Exception:
+            continue
+        if v:
+            return v
+    return ""
+
+
+def _int(s: str) -> int:
+    m = re.match(r"\s*(\d{1,6})", s)
+    return int(m.group(1)) if m else 0
+
+
+_YEAR = re.compile(r"(1[0-9]{3}|20[0-9]{2})")
+
+
+def _year(s: str) -> int:
+    m = _YEAR.search(s)
+    return int(m.group(1)) if m else 0
+
+
+def _seconds(v) -> float:
+    try:
+        d = float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(d, 1) if math.isfinite(d) and d > 0 else 0.0
+
+
+def _has_art(mut) -> bool:
+    if getattr(mut, "pictures", None):
+        return True
+    tags = getattr(mut, "tags", None)
+    if not tags:
+        return False
+    try:
+        return (any(str(k).startswith("APIC") for k in tags.keys())
+                or bool(tags.get("covr")) or bool(tags.get("metadata_block_picture")))
+    except Exception:
+        return False
+
+
+def read_mutagen(mut) -> list:
+    tags = mut.tags or {}
+    return [
+        _tag(tags, "TIT2", "title", "\xa9nam"),
+        _tag(tags, "TPE1", "artist", "\xa9ART"),
+        _tag(tags, "TALB", "album", "\xa9alb"),
+        _tag(tags, "TPE2", "albumartist", "album artist", "aART"),
+        _int(_tag(tags, "TRCK", "tracknumber", "trkn")),
+        _int(_tag(tags, "TPOS", "discnumber", "disk")),
+        _year(_tag(tags, "TDRC", "TYER", "TDOR", "date", "year", "originaldate", "\xa9day")),
+        _tag(tags, "TCON", "genre", "\xa9gen"),
+        _seconds(getattr(getattr(mut, "info", None), "length", 0)),
+        int(_has_art(mut)),
+    ]
+
+
+def read_matroska(path: str) -> list:
+    """WebM/Matroska tags via enzyme. Untargeted tags (what ffmpeg/yt-dlp write) count as track level."""
+    with open(path, "rb") as fh:
+        mkv = enzyme.MKV(fh)
+    tags: dict[tuple[int, str], str] = {}
+    for tag in mkv.tags:
+        targets = getattr(tag.targets, "data", tag.targets) or []
+        level = next((e.data for e in targets if getattr(e, "name", "") == "TargetTypeValue"), 0)
+        for st in tag.simpletags:
+            if isinstance(st.string, str) and st.string.strip():
+                tags.setdefault((int(level or 0), st.name.upper()), st.string.strip())
+
+    def pick(names, levels=(30, 0, 50)) -> str:
+        return next((tags[(lv, n)] for n in names for lv in levels if (lv, n) in tags), "")
+
+    inf = mkv.info
+    track_title = tags.get((30, "TITLE"), "")
+    title = track_title or tags.get((0, "TITLE")) or (inf.title if inf and inf.title else "") or tags.get((50, "TITLE"), "")
+    artist = pick(("ARTIST", "PERFORMER"))
+    album_artist = pick(("ALBUM_ARTIST", "ALBUMARTIST")) or (tags.get((50, "ARTIST"), "") if (30, "ARTIST") in tags else "")
+    return [
+        str(title).strip(),
+        artist,
+        pick(("ALBUM",)) or (tags.get((50, "TITLE"), "") if track_title else ""),
+        album_artist,
+        _int(pick(("PART_NUMBER", "TRACKNUMBER", "TRACK"), (30, 0))),
+        _int(pick(("DISCNUMBER", "DISC"), (30, 0, 50)) or tags.get((40, "PART_NUMBER"), "")),
+        _year(pick(("DATE_RELEASED", "DATE_RECORDED", "DATE", "YEAR"))),
+        pick(("GENRE",)),
+        _seconds(inf.duration.total_seconds() if inf and inf.duration else 0),
+        0,
+    ]
+
+
+def _err(e: BaseException) -> str:
+    return f"{type(e).__name__}: {e}"[:200]
+
+
+def matroska_reader() -> bool:
+    if enzyme:
+        return True
+    if MutagenFile:                     # future mutagen releases may add Matroska support
+        with contextlib.suppress(Exception):
+            return importlib.util.find_spec("mutagen.matroska") is not None
+    return False
+
+
+def has_reader(ext: str) -> bool:
+    return matroska_reader() if ext in MATROSKA else MutagenFile is not None
+
+
+def parse_file(path: str, ext: str) -> tuple[str, list | str]:
+    """
+    → (source, record). source: "mutagen" | "enzyme" | "err" (record = message) |
+      "name"    no reader installed for this format (re-read once one is) |
+      "unknown" a reader ran but didn't recognise the format (listed by file name; not retried).
+    """
+    if MutagenFile:
+        try:
+            mut = MutagenFile(path)
+        except Exception as e:
+            return "err", _err(e)
+        if mut is not None:
+            try:
+                return "mutagen", read_mutagen(mut)
+            except Exception as e:
+                return "err", _err(e)
+    if ext in MATROSKA:
+        if not enzyme:
+            return "name", list(EMPTY_REC)
+        try:
+            return "enzyme", read_matroska(path)
+        except Exception as e:
+            return "err", _err(e)
+    return ("unknown" if MutagenFile else "name"), list(EMPTY_REC)
+
+
+def parser_versions() -> dict[str, str | None]:
+    return {"mutagen": getattr(mutagen, "version_string", None) if mutagen else None,
+            "enzyme": getattr(enzyme, "__version__", "?") if enzyme else None}
+
+
+def ensure_matroska_reader(count: int) -> None:
+    """Offer to install a WebM tag reader when .webm files are present but none is importable."""
+    global enzyme
+    if not count or matroska_reader():
+        return
+    warn(f"{count} .webm file{'s' * (count != 1)} found, but no WebM tag reader (enzyme) is installed.\n"
+         "   Without it they're listed by file name only: no artist, album or duration.")
+    for line in install_hint("enzyme"):
+        print(line, file=sys.stderr)
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        print("   Continuing without it (not an interactive terminal).", file=sys.stderr)
+        return
+    while True:
+        try:
+            ans = input("   [c]ontinue without it · [r]etry after installing · [a]bort  (c): ").strip().lower()
+        except EOFError:
+            print(file=sys.stderr)
+            ans = "c"
+        if ans in ("", "c", "continue"):
+            return
+        if ans in ("a", "abort", "q", "quit"):
+            die("Aborted.")
+        if ans in ("r", "retry"):
+            importlib.invalidate_caches()
+            with contextlib.suppress(Exception):            # a fresh `pip install --user` creates this dir
+                site.addsitedir(site.getusersitepackages())
+            enzyme = _load_enzyme()
+            if enzyme:
+                info(f"   ✓ enzyme {getattr(enzyme, '__version__', '')} loaded")
+                return
+            print(f"   ✗ still not importable by {sys.executable}", file=sys.stderr)
+
+
+def run_parallel(fn, items: list, jobs: int, on_done) -> None:
+    """
+    Map fn over items; on_done(item, result) runs on the calling thread.
+    jobs=0 (auto): tag parsing is CPU-bound under the GIL, so threads only pay off when reads wait on I/O
+    (NAS, HDD, cold cache). Read the first files sequentially and go parallel only if less than half of
+    the wall time was CPU time.
+    """
+    itr = iter(items)
+    if jobs == 0:
+        free_threaded = not getattr(sys, "_is_gil_enabled", lambda: True)()
+        jobs = min(16, (os.cpu_count() or 2) * 2) if free_threaded else 1
+        if not free_threaded:
+            wall, cpu, n = time.perf_counter(), time.process_time(), 0
+            for it in itertools.islice(itr, 200):
+                on_done(it, fn(it))
+                n += 1
+            wall, cpu = time.perf_counter() - wall, time.process_time() - cpu
+            if n == 200 and wall > 0.2 and cpu < wall / 2:
+                jobs = 8
+    if jobs <= 1:
+        for it in itr:
+            on_done(it, fn(it))
+        return
+    ex = ThreadPoolExecutor(jobs)
+    pending = {}
+    try:
+        for it in itertools.islice(itr, jobs * 4):
+            pending[ex.submit(fn, it)] = it
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for f in done:
+                on_done(pending.pop(f), f.result())
+                nxt = next(itr, None)
+                if nxt is not None:
+                    pending[ex.submit(fn, nxt)] = nxt
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
+
+
+# ── Cache (OUTPUT/.mugal/cache.json) ──────────────────────────────────────────
+def load_cache(path: Path) -> dict:
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        c = json.loads(path.read_text("utf-8"))
+        if c.get("v") == CACHE_VER and isinstance(c.get("files"), dict) and isinstance(c.get("parsers"), dict):
+            return c
+    return {"v": CACHE_VER, "parsers": {}, "files": {}}
+
+
+def cache_hit(e, size: int, mtime: int, ext: str, stale: set) -> bool:
+    if not (isinstance(e, list) and len(e) == 4 and e[0] == size and e[1] == mtime):
+        return False
+    src, rec = e[2], e[3]
+    if src == "err":
+        return isinstance(rec, str) and not stale
+    if src in stale or not (isinstance(rec, list) and len(rec) == len(FIELDS)):
+        return False
+    return not (src == "name" and has_reader(ext))
+
+
+# ── Cover art ─────────────────────────────────────────────────────────────────
+def pick_image(images: list[tuple[str, int]]) -> str | None:
+    def prio(name: str) -> int:
+        stem = os.path.splitext(name)[0].lower()
+        return next((i for i, rx in enumerate(ART_RES) if rx.search(stem)), len(ART_RES))
+    best = min(images, key=lambda im: (prio(im[0]), -im[1], im[0]), default=None)  # name, then largest
+    return best[0] if best else None
+
+
+def _sniff(data: bytes) -> str | None:
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:4] == b"GIF8":
+        return ".gif"
     return None
 
-def get_embedded_art(mut) -> tuple[bytes, str] | None:
-    """Return (raw_bytes, mime) of embedded cover art, or None."""
+
+def embedded_art(path: str) -> tuple[bytes, str] | None:
+    """(image bytes, extension) of the embedded front cover (or first picture), or None."""
     try:
-        if getattr(mut, "tags", None):
-            # ID3 APIC
-            for key in mut.tags.keys():
-                if str(key).startswith("APIC"):
-                    apic = mut.tags[key]
-                    return apic.data, getattr(apic, "mime", "image/jpeg")
-            # MP4 covr
-            covr = mut.tags.get("covr")
-            if covr:
-                c = covr[0]
-                mime = "image/png" if getattr(c, "imageformat", 13) == 14 else "image/jpeg"
-                return bytes(c), mime
-        # FLAC / Vorbis pictures
-        if getattr(mut, "pictures", None):
-            pic = mut.pictures[0]
-            return pic.data, pic.mime or "image/jpeg"
+        mut = MutagenFile(path)
+        pics: list[tuple[int, bytes]] = []                  # (picture type, data); 3 = front cover
+        tags = getattr(mut, "tags", None)
+        if tags:
+            for k in tags.keys():
+                if str(k).startswith("APIC"):
+                    a = tags[k]
+                    pics.append((getattr(a, "type", 0), a.data))
+            for c in tags.get("covr") or []:
+                pics.append((3, bytes(c)))
+            for b in tags.get("metadata_block_picture") or []:
+                from mutagen.flac import Picture
+                p = Picture(base64.b64decode(b))
+                pics.append((p.type, p.data))
+        for p in getattr(mut, "pictures", None) or []:
+            pics.append((p.type, p.data))
+        pics.sort(key=lambda p: p[0] != 3)
+        for _, data in pics:
+            ext = _sniff(data or b"")
+            if ext and len(data) < 32 << 20:
+                return data, ext
     except Exception:
         pass
     return None
 
-def get_tag(mut, *keys, default="") -> str:
-    """Pull first available tag value as a clean string."""
-    if not mut or not mut.tags:
-        return default
-    for key in keys:
-        try:
-            val = mut.tags.get(key)
-            if val is None:
-                continue
-            if hasattr(val, "text"):          # ID3 text frame
-                v = str(val.text[0]) if val.text else ""
-            elif isinstance(val, list):
-                v = str(val[0]) if val else ""
-            else:
-                v = str(val)
-            v = v.strip()
-            if v:
-                return v
-        except Exception:
+
+def resolve_art(folders: dict[str, list[tuple[str, int]]], images: dict, root: Path,
+                covers: Path | None, fallback: Path, problems: list) -> dict[str, Path]:
+    """
+    One cover per track folder, by priority:
+      1. an image file in the folder (cover > folder > front > albumart > album > artwork > art > any; largest wins)
+      2. art embedded in one of its tracks, extracted once: to `covers` if given, else cover.<ext> in the
+         folder, else (read-only folder/drive) to `fallback`
+      3. the nearest ancestor folder's cover (not the library root's)
+    `folders` maps rel folder → [(abs track path, has_art)].
+    """
+    art: dict[str, Path] = {}
+    ro_devs: set[int] = set()
+    told = False
+    for rel in sorted(folders, key=lambda f: f.count("/") + (f != "")):   # parents before children
+        folder = root / rel if rel else root
+        img = pick_image(images.get(rel, []))
+        if img:
+            art[rel] = folder / img
             continue
-    return default
+        src = next((p for p, has in folders[rel] if has), None)
+        if src and MutagenFile:
+            got = _extract(src, rel, folder, covers, fallback, ro_devs)
+            if isinstance(got, tuple):
+                art[rel] = got[0]
+                if got[1] and got[0].parent == fallback and not told:
+                    info(f"ℹ  Read-only folder(s): extracted covers go to {fallback}")
+                    told = True
+                continue
+            if got:
+                problems.append((rel or ".", got))
+        parts = rel.split("/")
+        for i in range(len(parts) - 1, 0, -1):              # ancestors, excluding the root
+            anc = "/".join(parts[:i])
+            hit = art.get(anc) or ((root / anc / ai) if (ai := pick_image(images.get(anc, []))) else None)
+            if hit:
+                art[rel] = hit
+                break
+    return art
 
-def get_int_tag(mut, *keys, default=0) -> int:
-    raw = get_tag(mut, *keys, default="")
-    # Handle "3/12" track number format
-    if raw:
-        raw = raw.split("/")[0].strip()
+
+def _extract(track: str, rel: str, folder: Path, covers: Path | None, fallback: Path, ro_devs: set):
+    """Write the embedded cover of `track`; → (Path, newly written?) | error message | None (no art)."""
+    key = hashlib.blake2b(rel.encode("utf-8", "surrogateescape"), digest_size=8).hexdigest()
+    for d in filter(None, (covers, fallback)):              # reuse a cover extracted on an earlier run
+        for ext in (".jpg", ".png", ".webp", ".gif"):
+            if (d / f"{key}{ext}").is_file():
+                return d / f"{key}{ext}", False
+    emb = embedded_art(track)
+    if not emb:
+        return None
+    data, ext = emb
+    targets = [covers / f"{key}{ext}"] if covers else [folder / f"cover{ext}", fallback / f"{key}{ext}"]
+    last = None
+    for target in targets:
+        if target.parent == folder and target.exists():     # never overwrite the user's files
+            return target, False
+        with contextlib.suppress(OSError):
+            if target.parent == folder and folder.stat().st_dev in ro_devs:
+                continue
         try:
-            return int(raw)
-        except ValueError:
-            pass
-    return default
+            write_atomic(target, data)
+            return target, True
+        except OSError as e:
+            if e.errno == errno.EROFS:
+                with contextlib.suppress(OSError):
+                    ro_devs.add(folder.stat().st_dev)
+            last = f"cover not saved ({e.strerror or e})"
+    return last
 
-def scan_file(path: Path, root: Path, min_duration: float) -> dict | None:
-    """Return track metadata dict or None if not audio / too short."""
-    rel = path.relative_to(root)
-    rel_str = str(rel).replace("\\", "/")
-    folder_rel = str(rel.parent).replace("\\", "/")
-    if folder_rel == ".":
-        folder_rel = ""
 
-    if not HAS_MUTAGEN:
-        # Bare minimum without mutagen
-        return {
-            "path": rel_str,
-            "title": path.stem,
-            "artist": "",
-            "album": folder_rel,
-            "albumArtist": "",
-            "track": 0,
-            "disc": 0,
-            "year": "",
-            "genre": "",
-            "duration": 0,
-            "folder": folder_rel,
-        }
+# ── Output ────────────────────────────────────────────────────────────────────
+def write_atomic(path: Path, data: str | bytes) -> None:
+    """Write via temp file + rename so readers never see a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        um = os.umask(0)
+        os.umask(um)
+        mode = 0o666 & ~um
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data.encode("utf-8") if isinstance(data, str) else data)
+        os.chmod(tmp, mode)                                 # mkstemp is 0600; web servers need to read it
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:                         # Windows: target briefly locked
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def href(target: Path, out_dir: Path) -> str:
+    """URL of target as seen from index.html in out_dir: relative POSIX path, or file:// URI across drives."""
+    try:
+        return Path(os.path.relpath(target, out_dir)).as_posix()
+    except ValueError:
+        return target.as_uri()
+
+
+_DIGITS = re.compile(r"(\d+)")
+_MARKS = dict.fromkeys(range(0x300, 0x370))                 # combining diacritics
+
+
+def natural(s: str) -> tuple:
+    """Case/accent-insensitive natural sort key: 'Track 2' < 'track 10' < 'Über'."""
+    parts = _DIGITS.split(unicodedata.normalize("NFKD", s.casefold()).translate(_MARKS))
+    parts[1::2] = [int(p) for p in parts[1::2]]
+    return tuple(parts)
+
+
+@functools.lru_cache(maxsize=None)
+def folder_key(rel: str) -> tuple:
+    # raw name as tie-break: "Abc" and "abc" (distinct folders on Linux) must not interleave,
+    # the player relies on every folder subtree being one contiguous range
+    return tuple((natural(p), p) for p in rel.split("/")) if rel else ()
+
+
+def build_payload(entries: list, art: dict[str, Path], root: Path, out_dir: Path) -> dict:
+    """
+    Compact layout (schema 2). Tracks are sorted depth-first by folder, then disc, track, file name,
+    so every folder subtree is one contiguous range. Repeated strings live once in `strings`.
+      folders: [rel path]            art: [strings index per folder, 0 = none]
+      tracks:  [folder, file, title ("" = file stem), artist, album, albumArtist (0 = artist),
+                track, disc, year, genre, duration]   (artist/album/albumArtist/genre = strings index)
+    """
+    entries.sort(key=lambda e: (folder_key(e[0]), e[2][5], e[2][4], natural(e[1])))
+    folders = list(dict.fromkeys(e[0] for e in entries))
+    fidx = {f: i for i, f in enumerate(folders)}
+    strings: dict[str, int] = {"": 0}
+    s = lambda v: strings.setdefault(v, len(strings))       # noqa: E731
+    rows = []
+    for rel, name, r in entries:
+        title, artist, album, aa, track, disc, year, genre, dur, _ = r
+        rows.append([fidx[rel], name, "" if title == os.path.splitext(name)[0] else title,
+                     s(artist), s(album), s("" if aa == artist else aa), track, disc, year, s(genre), dur])
+    art_col = [s(href(art[f], out_dir)) if f in art else 0 for f in folders]
+    base = "" if root == out_dir else href(root, out_dir).rstrip("/") + "/"
+    body = {"folders": folders, "art": art_col, "strings": list(strings), "tracks": rows}
+    digest = hashlib.blake2b(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+                             digest_size=6).hexdigest()
+    return {"schema": SCHEMA, "version": digest, "generated": int(time.time()), "root": str(root),
+            "base": "" if base == "./" else base, "count": len(rows), **body}
+
+
+def write_datafile(payload: dict, out_dir: Path) -> int:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # JSON.parse of a string literal parses ~1.7× faster than the equivalent object literal
+    js = f"window.__AUDIO_DATA=JSON.parse({json.dumps(body, ensure_ascii=False)});\n"
+    out = out_dir / DATAFILE
+    write_atomic(out, js)
+    return out.stat().st_size
+
+
+def write_html(out_dir: Path, force: bool) -> bool:
+    try:
+        tpl = TEMPLATE.read_text("utf-8")
+    except OSError as e:
+        die(f"player template not found: {TEMPLATE} ({e.strerror or e}) — keep player.html next to mugal.py")
+    out = out_dir / HTMLFILE
+    if out.exists() and not force:
+        try:
+            current = out.read_text("utf-8", errors="replace")[:400_000]
+        except OSError:
+            current = ""
+        if not any(m in current for m in MARKERS):
+            warn(f"{out} exists and wasn't made by mugal — left untouched (use --force to overwrite)")
+            return False
+    write_atomic(out, tpl)
+    return True
+
+
+def write_report(out_dir: Path, problems: list) -> Path | None:
+    path = out_dir / STATE_DIR / "scan-report.txt"
+    if not problems:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    lines = [f"mugal scan report — {time.strftime('%Y-%m-%d %H:%M')}", ""]
+    lines += [f"{reason}\t{p}" for p, reason in sorted(problems, key=lambda x: (x[1], x[0]))]
+    with contextlib.suppress(OSError):
+        write_atomic(path, "\n".join(lines) + "\n")
+        return path
+    return None
+
+
+# ── Scan ──────────────────────────────────────────────────────────────────────
+def scan(a, root: Path, out_dir: Path, covers: Path | None) -> tuple[dict, dict]:
+    t0 = time.monotonic()
+    problems: list[tuple[str, str]] = []
+    found = 0
+    tick = progress_bar("Finding audio files")
+
+    def on_dir(n: int) -> None:
+        nonlocal found
+        found += n
+        tick(found)
+
+    dirs = walk(root, a.exclude, a.all, problems, on_dir)
+    tick(found, final=True)
+    files = [(rel, path, name, size, mtime) for rel, path, audio, _ in dirs for name, size, mtime in audio]
+    images = {rel: imgs for rel, _, _, imgs in dirs if imgs}
+    if not files:
+        die(f"No audio files found in {root} — nothing written.")
+
+    ensure_matroska_reader(sum(os.path.splitext(f[2])[1].lower() in MATROSKA for f in files))
+
+    cache_path = out_dir / STATE_DIR / "cache.json"
+    cache = {"v": CACHE_VER, "parsers": {}, "files": {}} if a.force_rescan else load_cache(cache_path)
+    now = parser_versions()
+    stale = {k for k, v in cache["parsers"].items() if now.get(k) and now[k] != v}
+    old, fresh, todo = cache["files"], {}, []
+    for rel, path, name, size, mtime in files:
+        key = f"{rel}/{name}" if rel else name
+        ext = os.path.splitext(name)[1].lower()
+        if cache_hit(old.get(key), size, mtime, ext, stale):
+            fresh[key] = old[key]
+        else:
+            todo.append((key, os.path.join(path, name), ext, size, mtime))
+    cache["files"] = old = None                             # free the previous cache early
+
+    tick = progress_bar("Reading tags", len(todo))
+    done = 0
+
+    def on_done(item, res) -> None:
+        nonlocal done
+        fresh[item[0]] = [item[3], item[4], res[0], res[1]]
+        done += 1
+        if a.verbose:
+            info(f"  {'✗' if res[0] == 'err' else '·'} {_printable(item[0])}")
+        else:
+            tick(done)
+
+    gc.freeze()       # keep the GC from re-traversing the (100k-entry) cache on every collection: ~2× faster
+    try:
+        run_parallel(lambda it: parse_file(it[1], it[2]), todo, a.jobs, on_done)
+    finally:
+        gc.unfreeze()
+        if todo and not a.verbose:
+            tick(done, final=True)
+        with contextlib.suppress(OSError):                  # keep progress even when interrupted
+            write_atomic(cache_path, json.dumps(
+                {"v": CACHE_VER, "parsers": {**cache["parsers"], **{k: v for k, v in now.items() if v}},
+                 "files": fresh}, ensure_ascii=False, separators=(",", ":")))
+
+    entries, track_folders = [], {}
+    unread = no_reader = short = 0
+    for rel, path, name, _, _ in files:
+        key = f"{rel}/{name}" if rel else name
+        src, rec = fresh[key][2], fresh[key][3]
+        if src == "err":
+            unread += 1
+            problems.append((_printable(key), f"unreadable, skipped ({rec})"))
+            continue
+        if src == "name":
+            no_reader += 1
+            if MutagenFile:                                 # without mutagen every file is "name": no spam
+                problems.append((_printable(key), "no tag reader installed, listed by file name"))
+        if a.min_duration and 0 < rec[8] < a.min_duration:
+            short += 1
+            continue
+        entries.append((rel, name, rec))
+        track_folders.setdefault(rel, []).append((os.path.join(path, name), rec[9]))
+
+    art = {} if a.no_art else resolve_art(track_folders, images, root, covers,
+                                          out_dir / STATE_DIR / "covers", problems)
+    stats = {"files": len(files), "parsed": len(todo), "unread": unread, "no_reader": no_reader,
+             "short": short, "problems": problems, "secs": time.monotonic() - t0,
+             "duration": sum(e[2][8] for e in entries)}
+    return build_payload(entries, art, root, out_dir), stats
+
+
+# ── Serve (debug helper) ──────────────────────────────────────────────────────
+def serve(out_dir: Path, root: Path, covers: Path | None, host: str, port: int, open_browser: bool,
+          verbose: bool) -> None:
+    import http.server
+    import urllib.parse
 
     try:
-        mut = MutagenFile(path, easy=False)
-    except Exception:
-        return None
-
-    if mut is None:
-        return None
-
-    duration = getattr(mut, "info", None) and getattr(mut.info, "length", 0) or 0
-    if duration < min_duration:
-        return None
-
-    # ── Tags ──────────────────────────────────────────────────────────────────
-    title       = get_tag(mut, "TIT2", "title",       "\xa9nam", "TITLE",       default=path.stem)
-    artist      = get_tag(mut, "TPE1", "artist",      "\xa9ART", "ARTIST",      default="")
-    album       = get_tag(mut, "TALB", "album",       "\xa9alb", "ALBUM",       default=folder_rel)
-    album_artist= get_tag(mut, "TPE2", "albumartist", "aART",    "ALBUMARTIST", default=artist)
-    year        = get_tag(mut, "TDRC", "date",        "\xa9day", "DATE",        "YEAR", default="")
-    genre       = get_tag(mut, "TCON", "genre",       "\xa9gen", "GENRE",       default="")
-    track_no    = get_int_tag(mut, "TRCK", "tracknumber", "trkn", "TRACKNUMBER")
-    disc_no     = get_int_tag(mut, "TPOS", "discnumber", "disk",  "DISCNUMBER")
-
-    # Normalise year to 4-digit string
-    year = re.sub(r"[^\d].*", "", str(year))[:4] if year else ""
-
-    return {
-        "path":        rel_str,
-        "title":       title,
-        "artist":      artist,
-        "album":       album,
-        "albumArtist": album_artist,
-        "track":       track_no,
-        "disc":        disc_no,
-        "year":        year,
-        "genre":       genre,
-        "duration":    round(duration, 2),
-        "folder":      folder_rel,
-    }
-
-# ── Folder art resolution ─────────────────────────────────────────────────────
-def resolve_folder_art(tracks: list[dict], root: Path) -> dict[str, str]:
-    """
-    One cover image per folder, referenced by relative path (scaled in CSS):
-      1. an existing image file in the folder (cover/folder/album/...)
-      2. else embedded art from the first track that has any, extracted
-         once to cover.<ext> in that folder
-    Returns {folder_rel: art_rel_path}.
-    """
-    folder_art: dict[str, str] = {}
-    by_folder: dict[str, list[dict]] = {}
-    for t in tracks:
-        by_folder.setdefault(t["folder"], []).append(t)
-
-    for folder_rel, folder_tracks in by_folder.items():
-        folder = root / folder_rel if folder_rel else root
-        art_file = find_art(folder)
-        if not art_file and HAS_MUTAGEN:
-            for t in folder_tracks:
-                try:
-                    mut = MutagenFile(root / t["path"], easy=False)
-                except Exception:
-                    continue
-                emb = get_embedded_art(mut) if mut else None
-                if emb:
-                    data, mime = emb
-                    art_file = folder / ("cover" + MIME_EXT.get(mime.lower(), ".jpg"))
-                    if not art_file.exists():
-                        try:
-                            art_file.write_bytes(data)
-                            print(f"  ✓ Extracted {art_file.relative_to(root)}")
-                        except Exception:
-                            art_file = None
-                    break
-        if art_file:
-            folder_art[folder_rel] = str(art_file.relative_to(root)).replace("\\", "/")
-    return folder_art
-
-# ── Main scan ─────────────────────────────────────────────────────────────────
-def scan(root: Path, args) -> tuple[list[dict], dict[str, str]]:
-    tracks = []
-    all_files = sorted(root.rglob("*"))
-    audio_files = [f for f in all_files
-                   if f.is_file()
-                   and f.suffix.lower() in AUDIO_EXTS
-                   and not is_excluded(f, root, args.exclude)]
-
-    total = len(audio_files)
-    if not total:
-        print("⚠  No audio files found.", file=sys.stderr)
-        return [], {}
-
-    print(f"Scanning {total} audio files…")
-    t0 = time.time()
-
-    for i, f in enumerate(audio_files):
-        if args.verbose:
-            print(f"  [{i+1}/{total}] {f.relative_to(root)}")
-        else:
-            pct = int(50 * (i + 1) / total)
-            bar = "█" * pct + "░" * (50 - pct)
-            print(f"\r  [{bar}] {i+1}/{total}", end="", flush=True)
-
-        track = scan_file(f, root, min_duration=args.min_duration)
-        if track:
-            tracks.append(track)
-
-    elapsed = time.time() - t0
-    print(f"\n✓ Scanned {len(tracks)} tracks in {elapsed:.1f}s")
-
-    folder_art = {} if args.no_art else resolve_folder_art(tracks, root)
-    return tracks, folder_art
-
-# ── Write audiodata.js ────────────────────────────────────────────────────────
-def write_datafile(tracks: list[dict], folder_art: dict, out_dir: Path, root: Path) -> str:
-    """Write audiodata.js and return its version hash."""
-    payload = {
-        "version":   hashlib.md5(
-            json.dumps([t["path"] for t in tracks]).encode()
-        ).hexdigest()[:12],
-        "generated": int(time.time()),
-        "root":      str(root),
-        "count":     len(tracks),
-        "folderArt": folder_art,
-        "tracks":    tracks,
-    }
-    js_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    out = out_dir / DATAFILE
-    out.write_text(f"window.__AUDIO_DATA={js_body};", encoding="utf-8")
-    size_kb = out.stat().st_size / 1024
-    print(f"✓ Wrote {DATAFILE} ({size_kb:.0f} KB)")
-    return payload["version"]
-
-# ── Write index.html (embedded, no external deps) ────────────────────────────
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Music</title>
-<style>
-/* ── Reset & tokens ─────────────────────────────────────────────────────── */
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{
-  --bg:        #0D0F14;
-  --bg2:       #13161E;
-  --bg3:       #1A1D26;
-  --panel:     #111318;
-  --border:    #23262F;
-  --text:      #E0DAD0;
-  --text2:     #8A8480;
-  --text3:     #55524E;
-  --accent:    #C8873A;
-  --accent2:   #9B5E1E;
-  --playing:   #3FC87A;
-  --hover:     rgba(200,135,58,.08);
-  --sel:       rgba(200,135,58,.14);
-  --radius:    6px;
-  --sans:      'Inter',-apple-system,sans-serif;
-  --mono:      'JetBrains Mono','Fira Mono',monospace;
-  --now-h:     4rem;
-  --tree-w:    260px;
-}
-html{font-size:14px} /* overridden by the font-size setting; all text is rem-based */
-html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.4}
-
-/* ── Layout ─────────────────────────────────────────────────────────────── */
-#app{display:flex;flex-direction:column;height:100vh}
-#topbar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--border);flex-shrink:0;z-index:10}
-#main{display:flex;flex:1;overflow:hidden}
-#sidebar{width:var(--tree-w);min-width:180px;max-width:420px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;user-select:none}
-#resizer{width:4px;background:transparent;cursor:col-resize;flex-shrink:0;transition:background .15s}
-#resizer:hover,#resizer.dragging{background:var(--accent)}
-#tracklist{flex:1;overflow-y:auto;background:var(--bg)}
-#nowbar{height:var(--now-h);background:var(--panel);border-top:1px solid var(--border);display:flex;align-items:center;gap:12px;padding:0 16px;flex-shrink:0}
-
-/* ── Topbar ─────────────────────────────────────────────────────────────── */
-#logo{font-family:var(--mono);font-size:0.9286rem;color:var(--accent);letter-spacing:.08em;white-space:nowrap;margin-right:4px}
-#search{flex:1;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);color:var(--text);padding:6px 10px;font-size:0.9286rem;outline:none;font-family:var(--sans);min-width:0}
-#search:focus{border-color:var(--accent)}
-#search::placeholder{color:var(--text3)}
-#stats{font-size:0.7857rem;color:var(--text3);white-space:nowrap;font-family:var(--mono)}
-#settingsbtn{background:none;border:none;cursor:pointer;color:var(--text2);font-size:1.1429rem;padding:4px 6px;border-radius:var(--radius)}
-#settingsbtn:hover{color:var(--text);background:var(--bg3)}
-
-/* ── Settings popover ───────────────────────────────────────────────────── */
-#settingspop{position:fixed;top:44px;right:14px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;z-index:100;display:none;min-width:220px;box-shadow:0 8px 32px rgba(0,0,0,.6)}
-#settingspop.open{display:block}
-#settingspop h3{font-size:0.7857rem;color:var(--text3);text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
-.sp-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;gap:8px}
-.sp-row span{font-size:0.8571rem;color:var(--text2)}
-.sp-btn{background:var(--bg);border:1px solid var(--border);color:var(--text);font-size:0.7857rem;padding:4px 10px;border-radius:var(--radius);cursor:pointer}
-.sp-btn:hover{border-color:var(--accent);color:var(--accent)}
-.sp-btn.danger:hover{border-color:#c84040;color:#c84040}
-.sp-stepper{display:flex;align-items:center;gap:6px}
-.sp-stepper .sp-btn{padding:2px 8px;font-family:var(--mono);line-height:1.2}
-#fs-val{font-family:var(--mono);font-size:0.7857rem;color:var(--text);width:34px;text-align:center}
-#idb-status{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);margin-top:8px;border-top:1px solid var(--border);padding-top:8px}
-
-/* ── Sidebar tree ───────────────────────────────────────────────────────── */
-#tree-header{padding:10px 12px 6px;font-size:0.7143rem;color:var(--text3);letter-spacing:.1em;text-transform:uppercase;flex-shrink:0}
-#tree{flex:1;overflow-y:auto;padding-bottom:8px}
-.tn{display:flex;align-items:center;gap:5px;padding:4px 10px 4px;cursor:pointer;border-radius:4px;margin:1px 4px;font-size:0.8571rem;color:var(--text2);transition:background .1s}
-.tn:hover{background:var(--hover);color:var(--text)}
-.tn.active{background:var(--sel);color:var(--accent)}
-.tn .arrow{width:12px;text-align:center;color:var(--text3);font-size:0.6429rem;flex-shrink:0;transition:transform .15s}
-.tn.open .arrow{transform:rotate(90deg)}
-.tn .icon{flex-shrink:0;opacity:.6;font-size:0.7857rem}
-.tn .label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-size:0.7857rem}
-.tn .cnt{font-size:0.6429rem;color:var(--text3);flex-shrink:0}
-.tc{padding-left:16px;overflow:hidden}
-.tc.collapsed{display:none}
-
-/* ── Track list ─────────────────────────────────────────────────────────── */
-#tracklist-header{display:grid;grid-template-columns:28px 1fr 160px 100px 50px;gap:0;padding:6px 14px;position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--border);font-size:0.7143rem;color:var(--text3);letter-spacing:.08em;text-transform:uppercase;z-index:5}
-.tr{display:grid;grid-template-columns:28px 1fr 160px 100px 50px;gap:0;padding:5px 14px;cursor:pointer;border-radius:4px;margin:1px 4px;transition:background .08s;align-items:center}
-.tr:hover{background:var(--hover)}
-.tr.playing{background:rgba(63,200,122,.07)}
-.tr.playing .t-title{color:var(--playing)}
-.tr.selected{background:var(--sel)}
-.tr .t-num{font-size:0.7857rem;color:var(--text3);font-family:var(--mono);text-align:right;padding-right:8px}
-.tr.playing .t-num{color:var(--playing)}
-.t-info{display:flex;flex-direction:column;overflow:hidden;gap:1px}
-.t-title{font-size:0.9286rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.t-sub{font-size:0.7857rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.t-artist{font-size:0.8571rem;color:var(--text2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.t-album{font-size:0.7857rem;color:var(--text3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
-.t-dur{font-size:0.7857rem;color:var(--text3);font-family:var(--mono);text-align:right}
-em.hl{color:var(--accent);font-style:normal}
-
-/* ── Album group headers ────────────────────────────────────────────────── */
-.album-h{display:flex;align-items:center;gap:10px;padding:8px 14px 6px;margin:8px 4px 2px;border-bottom:1px solid var(--border);cursor:context-menu}
-.album-h .ah-art{width:40px;height:40px;border-radius:4px;background:var(--bg3);flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:1.2857rem;color:var(--text3)}
-.album-h .ah-art img{width:100%;height:100%;object-fit:cover}
-.album-h .ah-name{font-size:0.9286rem;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.album-h .ah-meta{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);white-space:nowrap}
-.album-h .ah-text{overflow:hidden;min-width:0}
-
-/* ── Context menu ───────────────────────────────────────────────────────── */
-#ctxmenu{position:fixed;z-index:300;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 8px 32px rgba(0,0,0,.6);padding:4px;display:none;min-width:180px;user-select:none}
-#ctxmenu.open{display:block}
-.cm-item{display:flex;align-items:center;gap:8px;padding:6px 12px;font-size:0.8571rem;color:var(--text2);border-radius:4px;cursor:pointer;white-space:nowrap}
-.cm-item:hover{background:var(--hover);color:var(--text)}
-.cm-item .cm-ico{width:16px;text-align:center;opacity:.7;flex-shrink:0}
-.cm-sep{height:1px;background:var(--border);margin:4px 6px}
-
-/* ── Track info modal ───────────────────────────────────────────────────── */
-#modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:400;display:none;align-items:center;justify-content:center}
-#modal-overlay.open{display:flex}
-#modal{background:var(--bg2);border:1px solid var(--border);border-radius:10px;box-shadow:0 16px 64px rgba(0,0,0,.7);width:min(440px,92vw);max-height:86vh;overflow-y:auto;padding:0}
-#modal-head{display:flex;align-items:center;gap:12px;padding:16px 18px 12px;border-bottom:1px solid var(--border)}
-#modal-head .mh-art{width:64px;height:64px;border-radius:6px;background:var(--bg3);flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:1.8571rem;color:var(--text3)}
-#modal-head .mh-art img{width:100%;height:100%;object-fit:cover}
-#modal-head .mh-title{font-size:1.0714rem;color:var(--text);word-break:break-word}
-#modal-head .mh-sub{font-size:0.8571rem;color:var(--text2);margin-top:2px}
-#modal-close{margin-left:auto;align-self:flex-start;background:none;border:none;color:var(--text3);font-size:1.1429rem;cursor:pointer;padding:2px 6px;border-radius:4px}
-#modal-close:hover{color:var(--text);background:var(--bg3)}
-#modal-body{padding:12px 18px}
-.mi-row{display:flex;gap:10px;padding:4px 0;font-size:0.8571rem}
-.mi-row .mi-k{width:92px;flex-shrink:0;color:var(--text3);text-transform:uppercase;font-size:0.7143rem;letter-spacing:.06em;padding-top:1px}
-.mi-row .mi-v{color:var(--text2);word-break:break-word;font-family:var(--mono);font-size:0.7857rem}
-#modal-foot{display:flex;justify-content:flex-end;gap:8px;padding:10px 18px 14px;border-top:1px solid var(--border)}
-
-/* ── Art hover preview ──────────────────────────────────────────────────── */
-#artpreview{position:fixed;z-index:500;pointer-events:none;display:none;border-radius:8px;overflow:hidden;box-shadow:0 12px 48px rgba(0,0,0,.8);border:1px solid var(--border)}
-#artpreview img{display:block;max-width:320px;max-height:320px}
-
-/* ── Now playing bar ────────────────────────────────────────────────────── */
-#np-art{width:36px;height:36px;border-radius:3px;background:var(--bg3);flex-shrink:0;overflow:hidden;display:flex;align-items:center;justify-content:center}
-#np-art img{width:100%;height:100%;object-fit:cover}
-#np-art .placeholder{font-size:1.2857rem;opacity:.3}
-#np-info{flex:1;min-width:0}
-#np-title{font-size:0.9286rem;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#np-artist{font-size:0.7857rem;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#queue-info{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);white-space:nowrap;flex-shrink:0}
-#controls{display:flex;align-items:center;gap:4px;flex-shrink:0}
-.ctrl{background:none;border:none;color:var(--text2);cursor:pointer;padding:6px;border-radius:var(--radius);font-size:1.1429rem;transition:color .1s}
-.ctrl:hover{color:var(--text)}
-.ctrl.active{color:var(--accent)}
-#scrubber-wrap{flex:1;display:flex;align-items:center;gap:8px;min-width:0;max-width:320px}
-#time-cur,#time-tot{font-size:0.7143rem;color:var(--text3);font-family:var(--mono);width:32px;flex-shrink:0}
-#time-tot{text-align:right}
-#scrubber{flex:1;-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;background:var(--bg3);outline:none;cursor:pointer}
-#scrubber::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;background:var(--accent);cursor:pointer}
-#vol-wrap{display:flex;align-items:center;gap:6px;flex-shrink:0}
-#vol{width:70px;-webkit-appearance:none;appearance:none;height:3px;border-radius:2px;background:var(--bg3);outline:none;cursor:pointer}
-#vol::-webkit-slider-thumb{-webkit-appearance:none;width:10px;height:10px;border-radius:50%;background:var(--text2);cursor:pointer}
-#vol-icon{font-size:1rem;color:var(--text3)}
-
-/* ── Toast ──────────────────────────────────────────────────────────────── */
-#toast{position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--border);color:var(--text2);font-size:0.8571rem;padding:7px 16px;border-radius:20px;z-index:600;opacity:0;transition:opacity .2s;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.5)}
-#toast.show{opacity:1}
-
-/* ── Scrollbars ─────────────────────────────────────────────────────────── */
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-::-webkit-scrollbar-thumb:hover{background:var(--text3)}
-
-/* ── Empty/loading states ───────────────────────────────────────────────── */
-#loader{display:flex;align-items:center;justify-content:center;height:100%;flex-direction:column;gap:8px;color:var(--text3)}
-#loader .spin{font-size:1.7143rem;animation:spin 1s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-#empty{display:none;align-items:center;justify-content:center;height:100%;color:var(--text3);font-size:0.9286rem}
-
-/* ── Responsive resizer ─────────────────────────────────────────────────── */
-@media(max-width:640px){
-  :root{--tree-w:0px}
-  #sidebar{display:none}
-  #resizer{display:none}
-}
-</style>
-</head>
-<body>
-<div id="app">
-
-  <!-- Topbar -->
-  <div id="topbar">
-    <span id="logo">♫ MUSIC</span>
-    <input id="search" type="search" placeholder="Search tracks, albums, paths…" autocomplete="off" spellcheck="false">
-    <span id="stats"></span>
-    <button id="settingsbtn" title="Settings">⚙</button>
-  </div>
-
-  <!-- Settings popover -->
-  <div id="settingspop">
-    <h3>Settings</h3>
-    <div class="sp-row"><span>Reload data from disk</span><button class="sp-btn" id="btn-reload">Reload</button></div>
-    <div class="sp-row"><span>Clear IndexedDB cache</span><button class="sp-btn danger" id="btn-clear-idb">Clear cache</button></div>
-    <div class="sp-row"><span>Shuffle all</span><button class="sp-btn" id="btn-shuffle-all">Shuffle</button></div>
-    <div class="sp-row"><span>Font size</span>
-      <span class="sp-stepper">
-        <button class="sp-btn" id="fs-minus" title="Smaller">−</button>
-        <span id="fs-val">14</span>
-        <button class="sp-btn" id="fs-plus" title="Larger">+</button>
-      </span>
-    </div>
-    <div id="idb-status"></div>
-  </div>
-
-  <div id="main">
-    <!-- Sidebar -->
-    <div id="sidebar">
-      <div id="tree-header">Library</div>
-      <div id="tree"></div>
-    </div>
-    <div id="resizer"></div>
-
-    <!-- Track list -->
-    <div id="tracklist">
-      <div id="loader"><span class="spin">◌</span><span>Loading library…</span></div>
-      <div id="tracklist-header" style="display:none">
-        <div></div><div>Title</div><div>Artist</div><div>Album</div><div>Time</div>
-      </div>
-      <div id="tracks-container"></div>
-      <div id="list-sentinel"></div>
-      <div id="empty">No tracks match your search.</div>
-    </div>
-  </div>
-
-  <!-- Now playing bar -->
-  <div id="nowbar">
-    <div id="np-art"><span class="placeholder">♪</span></div>
-    <div id="np-info"><div id="np-title" style="color:var(--text3)">Nothing playing</div><div id="np-artist"></div></div>
-    <span id="queue-info"></span>
-    <div id="controls">
-      <button class="ctrl" id="btn-prev" title="Previous">⏮</button>
-      <button class="ctrl" id="btn-play" title="Play/Pause" style="font-size:1.4286rem">▶</button>
-      <button class="ctrl" id="btn-next" title="Next">⏭</button>
-      <button class="ctrl" id="btn-repeat" title="Repeat">🔁</button>
-      <button class="ctrl" id="btn-shuffle" title="Shuffle">🔀</button>
-    </div>
-    <div id="scrubber-wrap">
-      <span id="time-cur">0:00</span>
-      <input id="scrubber" type="range" min="0" max="100" value="0" step="0.1">
-      <span id="time-tot">0:00</span>
-    </div>
-    <div id="vol-wrap">
-      <span id="vol-icon">🔊</span>
-      <input id="vol" type="range" min="0" max="1" value="0.8" step="0.01">
-    </div>
-  </div>
-</div>
-
-<!-- Context menu -->
-<div id="ctxmenu"></div>
-
-<!-- Track info modal -->
-<div id="modal-overlay">
-  <div id="modal">
-    <div id="modal-head"></div>
-    <div id="modal-body"></div>
-    <div id="modal-foot"><button class="sp-btn" id="modal-cancel">Cancel</button></div>
-  </div>
-</div>
-
-<!-- Art hover preview -->
-<div id="artpreview"><img alt=""></div>
-
-<!-- Toast -->
-<div id="toast"></div>
-
-<audio id="audio" preload="metadata"></audio>
-
-<script src="audiodata.js"></script>
-<script>
-// ═══════════════════════════════════════════════════════════════════════════
-// MUSIC PLAYER — file:// compatible, zero dependencies
-// ═══════════════════════════════════════════════════════════════════════════
-
-const IDB_NAME    = "MusicPlayer";
-const IDB_STORE   = "library";
-const IDB_VER     = 1;
-const IDB_KEY     = "data";
-const USE_IDB_MIN = 300; // tracks threshold
-const CHUNK       = 200; // rows rendered per lazy chunk
-
-// === State ===
-let ALL_TRACKS    = [];
-let FOLDER_ART    = {};   // folder rel path → cover image rel path
-let VIEW          = [];   // currently displayed subset (indices into ALL_TRACKS)
-let QUEUE         = [];   // play queue (indices into ALL_TRACKS)
-let QUEUE_POS     = -1;
-let ACTIVE_FOLDER = null; // null = all
-let SHUFFLED      = false;
-let REPEAT        = 0;    // 0=off 1=all 2=one
-let idbAvailable  = false;
-
-// === DOM refs ===
-const $ = id => document.getElementById(id);
-const audio       = $("audio");
-const searchEl    = $("search");
-const statsEl     = $("stats");
-const treeEl      = $("tree");
-const tracksEl    = $("tracks-container");
-const sentinelEl  = $("list-sentinel");
-const loaderEl    = $("loader");
-const emptyEl     = $("empty");
-const headerEl    = $("tracklist-header");
-const npTitle     = $("np-title");
-const npArtist    = $("np-artist");
-const npArt       = $("np-art");
-const queueInfoEl = $("queue-info");
-const scrubber    = $("scrubber");
-const timeCur     = $("time-cur");
-const timeTot     = $("time-tot");
-const volEl       = $("vol");
-const idbStatus   = $("idb-status");
-const ctxEl       = $("ctxmenu");
-const toastEl     = $("toast");
-
-const fmt = s => {
-  if (!s || isNaN(s)) return "0:00";
-  const m = Math.floor(s/60), sec = Math.floor(s%60);
-  return `${m}:${sec.toString().padStart(2,"0")}`;
-};
-
-const esc = s => String(s).replace(/[&<>"']/g, c =>
-  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-
-// Encode a relative path for use as a URL (handles #, ?, brackets…)
-const encPath = p => p.split("/").map(encodeURIComponent).join("/");
-// Absolute URL of a relative path — works over both http(s):// and file://
-const fullURL = p => new URL(encPath(p), location.href).href;
-
-const artOf = t => FOLDER_ART[t.folder] || null;
-
-function highlight(str, q) {
-  if (!q) return esc(str);
-  const idx = str.toLowerCase().indexOf(q.toLowerCase());
-  if (idx < 0) return esc(str);
-  return esc(str.slice(0,idx)) +
-    `<em class="hl">${esc(str.slice(idx, idx+q.length))}</em>` +
-    esc(str.slice(idx+q.length));
-}
-
-let toastTimer = null;
-function toast(msg) {
-  toastEl.textContent = msg;
-  toastEl.classList.add("show");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove("show"), 1800);
-}
-
-// === IndexedDB ===
-function openIDB() {
-  return new Promise((res, rej) => {
-    const req = indexedDB.open(IDB_NAME, IDB_VER);
-    req.onupgradeneeded = e => e.target.result.createObjectStore(IDB_STORE);
-    req.onsuccess = e => res(e.target.result);
-    req.onerror   = () => rej(req.error);
-  });
-}
-async function idbGet(db, key) {
-  return new Promise((res, rej) => {
-    const tx = db.transaction(IDB_STORE, "readonly");
-    const req = tx.objectStore(IDB_STORE).get(key);
-    req.onsuccess = () => res(req.result);
-    req.onerror   = () => rej(req.error);
-  });
-}
-async function idbSet(db, key, val) {
-  return new Promise((res, rej) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    const req = tx.objectStore(IDB_STORE).put(val, key);
-    req.onsuccess = () => res();
-    req.onerror   = () => rej(req.error);
-  });
-}
-async function clearIDB() {
-  const db = await openIDB();
-  await new Promise((res, rej) => {
-    const tx = db.transaction(IDB_STORE, "readwrite");
-    const req = tx.objectStore(IDB_STORE).clear();
-    req.onsuccess = res; req.onerror = rej;
-  });
-}
-
-// === load data ===
-async function boot() {
-  const raw = window.__AUDIO_DATA;
-  if (!raw || !raw.tracks) {
-    loaderEl.innerHTML = '<span>⚠ audiodata.js not found or empty.<br>Run scan_music.py in this folder.</span>';
-    return;
-  }
-  FOLDER_ART = raw.folderArt || {};
-
-  const useIDB = raw.tracks.length > USE_IDB_MIN;
-
-  if (useIDB) {
-    try {
-      const db = await openIDB();
-      idbAvailable = true;
-      const cached = await idbGet(db, IDB_KEY);
-      if (cached && cached.version === raw.version) {
-        ALL_TRACKS = cached.tracks;
-        idbStatus.textContent = `IDB cache hit · v${raw.version} · ${ALL_TRACKS.length} tracks`;
-      } else {
-        ALL_TRACKS = raw.tracks;
-        await idbSet(db, IDB_KEY, { version: raw.version, tracks: raw.tracks });
-        idbStatus.textContent = `IDB refreshed · v${raw.version} · ${ALL_TRACKS.length} tracks`;
-      }
-    } catch(e) {
-      ALL_TRACKS = raw.tracks;
-      idbStatus.textContent = "IDB unavailable — using direct load";
-    }
-  } else {
-    ALL_TRACKS = raw.tracks;
-    idbStatus.textContent = `Direct load (${ALL_TRACKS.length} tracks, IDB not needed)`;
-  }
-
-  init();
-}
-
-// === Build folder tree ======
-function buildTree(tracks) {
-  const root = {};
-  tracks.forEach((t, i) => {
-    const parts = t.folder ? t.folder.split("/") : [""];
-    let node = root;
-    for (const p of parts) {
-      if (!node[p]) node[p] = { children: {}, indices: [] };
-      node[p].indices.push(i);
-      node = node[p].children;
-    }
-  });
-  return root;
-}
-
-function renderTree(node, depth, parentPath) {
-  let html = "";
-  const entries = Object.entries(node).sort(([a],[b]) => a.localeCompare(b));
-  for (const [name, data] of entries) {
-    const path = parentPath ? `${parentPath}/${name}` : name;
-    const hasChildren = Object.keys(data.children).length > 0;
-    const arrow = hasChildren ? "▶" : "·";
-    const cnt   = data.indices.length;
-    const indent = depth * 14;
-    html += `<div class="tn" data-path="${esc(path)}" data-depth="${depth}" style="padding-left:${10+indent}px" title="${esc(path)}">
-      <span class="arrow">${arrow}</span>
-      <span class="icon">${hasChildren ? "📁" : "📂"}</span>
-      <span class="label">${esc(name || "[root]")}</span>
-      <span class="cnt">${cnt}</span>
-    </div>`;
-    if (hasChildren) {
-      html += `<div class="tc collapsed" data-parent="${esc(path)}">${renderTree(data.children, depth+1, path)}</div>`;
-    }
-  }
-  return html;
-}
-
-// ==== track list (lazy chunked rendering) ======
-let renderItems  = [];  // [{h: folder, n: count}] header | [{t: globalIdx}] track
-let renderedUpTo = 0;
-let renderQuery  = "";
-
-const listObserver = new IntersectionObserver(entries => {
-  if (entries.some(e => e.isIntersecting)) appendChunk();
-});
-
-function rowHTML(item, q) {
-  if (item.h !== undefined) {
-    const art = FOLDER_ART[item.h];
-    const name = item.h.split("/").pop() || "[root]";
-    return `<div class="album-h" data-folder="${esc(item.h)}" title="${esc(item.h)}">
-      <div class="ah-art"${art ? ` data-art="${esc(encPath(art))}"` : ""}>${
-        art ? `<img src="${esc(encPath(art))}" loading="lazy" alt="">` : "♪"}</div>
-      <div class="ah-text">
-        <div class="ah-name">${highlight(name, q)}</div>
-        <div class="ah-meta">${esc(item.h)} · ${item.n} track${item.n===1?"":"s"}</div>
-      </div>
-    </div>`;
-  }
-  const i = item.t, t = ALL_TRACKS[i];
-  const isPlaying = QUEUE[QUEUE_POS] === i;
-  const num = t.track ? t.track : "·";
-  return `<div class="tr${isPlaying?" playing":""}" data-idx="${i}">
-    <div class="t-num">${num}</div>
-    <div class="t-info">
-      <div class="t-title" title="${esc(t.title||t.path)}">${highlight(t.title||t.path,q)}</div>
-      ${t.artist?`<div class="t-sub" title="${esc(t.artist)}">${highlight(t.artist,q)}</div>`:""}
-    </div>
-    <div class="t-artist" title="${esc(t.artist||"")}">${highlight(t.artist||"",q)}</div>
-    <div class="t-album" title="${esc(t.album||"")}">${highlight(t.album||"",q)}</div>
-    <div class="t-dur">${fmt(t.duration)}</div>
-  </div>`;
-}
-
-function appendChunk() {
-  if (renderedUpTo >= renderItems.length) return;
-  const end = Math.min(renderedUpTo + CHUNK, renderItems.length);
-  let html = "";
-  for (let i = renderedUpTo; i < end; i++) html += rowHTML(renderItems[i], renderQuery);
-  tracksEl.insertAdjacentHTML("beforeend", html);
-  renderedUpTo = end;
-  if (renderedUpTo >= renderItems.length) listObserver.unobserve(sentinelEl);
-}
-
-function renderTracks(view, query) {
-  listObserver.unobserve(sentinelEl);
-  renderQuery = query || "";
-  if (!view.length) {
-    tracksEl.innerHTML = "";
-    renderItems = [];
-    emptyEl.style.display = "flex";
-    headerEl.style.display = "none";
-    return;
-  }
-  emptyEl.style.display = "none";
-  headerEl.style.display = "grid";
-
-  // Group headers when the view spans multiple folders
-  const folders = new Set();
-  view.forEach(i => folders.add(ALL_TRACKS[i].folder));
-  renderItems = [];
-  if (folders.size > 1) {
-    const counts = {};
-    view.forEach(i => { const f = ALL_TRACKS[i].folder; counts[f] = (counts[f]||0)+1; });
-    let cur = null;
-    for (const i of view) {
-      const f = ALL_TRACKS[i].folder;
-      if (f !== cur) { cur = f; renderItems.push({ h: f, n: counts[f] }); }
-      renderItems.push({ t: i });
-    }
-  } else {
-    for (const i of view) renderItems.push({ t: i });
-  }
-
-  tracksEl.innerHTML = "";
-  renderedUpTo = 0;
-  appendChunk();
-  if (renderedUpTo < renderItems.length) listObserver.observe(sentinelEl);
-  statsEl.textContent = `${view.length} tracks`;
-  $("tracklist").scrollTop = 0;
-}
-
-//====== Search =====
-let searchTimer = null;
-function folderPool() {
-  if (ACTIVE_FOLDER === null) return ALL_TRACKS.map((_, i) => i);
-  return folderTrackIdxs(ACTIVE_FOLDER);
-}
-function doSearch(q) {
-  q = q.trim().toLowerCase();
-  const pool = folderPool();
-  VIEW = !q ? pool : pool.filter(i => {
-    const t = ALL_TRACKS[i];
-    return (t.title  ||"").toLowerCase().includes(q) ||
-           (t.artist ||"").toLowerCase().includes(q) ||
-           (t.album  ||"").toLowerCase().includes(q) ||
-           (t.folder ||"").toLowerCase().includes(q);
-  });
-  renderTracks(VIEW, q);
-}
-
-//////////  Playback //////////////
-function folderTrackIdxs(folder) {
-  const idxs = [];
-  for (let i = 0; i < ALL_TRACKS.length; i++) {
-    const f = ALL_TRACKS[i].folder;
-    if (f === folder || f.startsWith(folder + "/")) idxs.push(i);
-  }
-  return idxs;
-}
-
-function buildQueue(startIdx) {
-  // Queue = current VIEW in order, start from clicked track
-  QUEUE = [...VIEW];
-  const pos = QUEUE.indexOf(startIdx);
-  QUEUE_POS = pos >= 0 ? pos : 0;
-  if (SHUFFLED) shuffleQueue(pos >= 0 ? pos : 0);
-  updateQueueInfo();
-}
-
-function shuffleQueue(keepFirst) {
-  const first = QUEUE[keepFirst !== undefined ? keepFirst : QUEUE_POS];
-  QUEUE = QUEUE.filter((_,i) => i !== (keepFirst !== undefined ? keepFirst : QUEUE_POS));
-  for (let i = QUEUE.length-1; i > 0; i--) {
-    const j = Math.floor(Math.random()*(i+1));
-    [QUEUE[i],QUEUE[j]] = [QUEUE[j],QUEUE[i]];
-  }
-  QUEUE.unshift(first);
-  QUEUE_POS = 0;
-  updateQueueInfo();
-}
-
-function updateQueueInfo() {
-  queueInfoEl.textContent = QUEUE.length
-    ? `♬ ${QUEUE_POS+1}/${QUEUE.length}` : "";
-}
-
-function playTrack(globalIdx) {
-  const t = ALL_TRACKS[globalIdx];
-  if (!t) return;
-  audio.src = encPath(t.path);
-  audio.volume = parseFloat(volEl.value);
-  audio.play().catch(()=>{});
-  updateNowBar(t);
-  highlightPlaying(globalIdx);
-  updateQueueInfo();
-  try { sessionStorage.setItem("lastTrack", globalIdx); } catch(_){}
-}
-
-function updateNowBar(t) {
-  npTitle.textContent  = t.title  || t.path;
-  npTitle.title        = t.title  || t.path;
-  npArtist.textContent = [t.artist, t.album].filter(Boolean).join(" — ");
-  npArtist.title       = npArtist.textContent;
-  npTitle.style.color  = "";
-  const art = artOf(t);
-  if (art) {
-    npArt.innerHTML = `<img src="${esc(encPath(art))}" alt="">`;
-    npArt.dataset.art = encPath(art);
-  } else {
-    npArt.innerHTML = `<span class="placeholder">♪</span>`;
-    delete npArt.dataset.art;
-  }
-  document.title = (t.title||t.path) + " — Music";
-}
-
-function highlightPlaying(globalIdx) {
-  document.querySelectorAll(".tr").forEach(el => {
-    const idx = parseInt(el.dataset.idx);
-    el.classList.toggle("playing", idx === globalIdx);
-  });
-  const el = document.querySelector(`.tr[data-idx="${globalIdx}"]`);
-  if (el) el.scrollIntoView({ block:"nearest", behavior:"smooth" });
-}
-
-function playNext() {
-  if (!QUEUE.length) return;
-  if (REPEAT === 2) { audio.currentTime=0; audio.play(); return; }
-  if (QUEUE_POS < QUEUE.length-1) {
-    QUEUE_POS++;
-  } else if (REPEAT === 1) {
-    QUEUE_POS = 0;
-  } else { return; }
-  playTrack(QUEUE[QUEUE_POS]);
-}
-
-function playPrev() {
-  if (audio.currentTime > 3) { audio.currentTime=0; return; }
-  if (QUEUE_POS > 0) QUEUE_POS--;
-  playTrack(QUEUE[QUEUE_POS]);
-}
-
-// Insert tracks right after the current queue position (or start playing if idle)
-function queueNext(idxs) {
-  if (!idxs.length) return;
-  if (!QUEUE.length) {
-    QUEUE = [...idxs]; QUEUE_POS = 0;
-    playTrack(QUEUE[0]);
-  } else {
-    QUEUE.splice(QUEUE_POS+1, 0, ...idxs);
-    toast(`${idxs.length} track${idxs.length===1?"":"s"} will play next`);
-  }
-  updateQueueInfo();
-}
-
-function queueAppend(idxs) {
-  if (!idxs.length) return;
-  if (!QUEUE.length) {
-    QUEUE = [...idxs]; QUEUE_POS = 0;
-    playTrack(QUEUE[0]);
-  } else {
-    QUEUE.push(...idxs);
-    toast(`${idxs.length} track${idxs.length===1?"":"s"} added to queue`);
-  }
-  updateQueueInfo();
-}
-
-function playFolder(folder) {
-  const idxs = folderTrackIdxs(folder);
-  if (!idxs.length) return;
-  QUEUE = idxs; QUEUE_POS = 0;
-  if (SHUFFLED) shuffleQueue(0);
-  playTrack(QUEUE[QUEUE_POS]);
-}
-
-function removeFromQueue(globalIdx) {
-  const pos = QUEUE.indexOf(globalIdx);
-  if (pos < 0 || pos === QUEUE_POS) return;
-  QUEUE.splice(pos, 1);
-  if (pos < QUEUE_POS) QUEUE_POS--;
-  updateQueueInfo();
-  toast("Removed from queue");
-}
-
-// ── Download / clipboard ──────────────────────────────────────────────────
-function downloadTrack(t) {
-  const a = document.createElement("a");
-  a.href = encPath(t.path);
-  a.download = t.path.split("/").pop();
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-}
-
-function copyText(text) {
-  const done = () => toast("Copied to clipboard");
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done).catch(() => copyFallback(text) && done());
-  } else if (copyFallback(text)) done();
-}
-function copyFallback(text) {
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.position = "fixed"; ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  let ok = false;
-  try { ok = document.execCommand("copy"); } catch(_){}
-  ta.remove();
-  return ok;
-}
-
-// ── Context menu ──────────────────────────────────────────────────────────
-let ctxActions = [];
-function showMenu(x, y, items) {
-  ctxActions = items;
-  ctxEl.innerHTML = items.map((it, i) =>
-    it.sep ? `<div class="cm-sep"></div>`
-           : `<div class="cm-item" data-i="${i}"><span class="cm-ico">${it.ico||""}</span>${esc(it.label)}</div>`
-  ).join("");
-  ctxEl.classList.add("open");
-  const r = ctxEl.getBoundingClientRect();
-  ctxEl.style.left = Math.min(x, innerWidth  - r.width  - 6) + "px";
-  ctxEl.style.top  = Math.min(y, innerHeight - r.height - 6) + "px";
-}
-function hideMenu() { ctxEl.classList.remove("open"); }
-
-ctxEl.addEventListener("click", e => {
-  const item = e.target.closest(".cm-item");
-  if (!item) return;
-  hideMenu();
-  const act = ctxActions[parseInt(item.dataset.i)];
-  if (act && act.fn) act.fn();
-});
-document.addEventListener("click", e => { if (!ctxEl.contains(e.target)) hideMenu(); });
-window.addEventListener("blur", hideMenu);
-document.addEventListener("scroll", hideMenu, true);
-
-function trackMenuItems(idx) {
-  const t = ALL_TRACKS[idx];
-  const isCurrent = QUEUE[QUEUE_POS] === idx;
-  const items = [];
-  if (isCurrent) {
-    items.push({ ico: audio.paused ? "▶" : "⏸",
-                 label: audio.paused ? "Play" : "Pause",
-                 fn: () => audio.paused ? audio.play() : audio.pause() });
-  } else {
-    items.push({ ico: "▶", label: "Play", fn: () => { buildQueue(idx); playTrack(idx); } });
-    items.push({ ico: "⏭", label: "Play next",   fn: () => queueNext([idx]) });
-    items.push({ ico: "＋", label: "Add to queue", fn: () => queueAppend([idx]) });
-    if (QUEUE.includes(idx))
-      items.push({ ico: "－", label: "Remove from queue", fn: () => removeFromQueue(idx) });
-  }
-  items.push({ ico: "📁", label: "Play folder", fn: () => playFolder(t.folder) });
-  items.push({ sep: true });
-  items.push({ ico: "⬇", label: "Download", fn: () => downloadTrack(t) });
-  items.push({ ico: "⧉", label: "Copy file URL", fn: () => copyText(fullURL(t.path)) });
-  items.push({ ico: "ℹ", label: "Track info", fn: () => showTrackInfo(idx) });
-  return items;
-}
-
-function folderMenuItems(folder) {
-  return [
-    { ico: "▶", label: "Play folder",  fn: () => playFolder(folder) },
-    { ico: "⏭", label: "Play next",    fn: () => queueNext(folderTrackIdxs(folder)) },
-    { ico: "＋", label: "Add to queue", fn: () => queueAppend(folderTrackIdxs(folder)) },
-    { sep: true },
-    { ico: "⧉", label: "Copy folder URL", fn: () => copyText(fullURL(folder) + "/") },
-  ];
-}
-
-$("tracklist").addEventListener("contextmenu", e => {
-  const tr = e.target.closest(".tr");
-  const ah = e.target.closest(".album-h");
-  if (!tr && !ah) return;
-  e.preventDefault();
-  showMenu(e.clientX, e.clientY,
-    tr ? trackMenuItems(parseInt(tr.dataset.idx))
-       : folderMenuItems(ah.dataset.folder));
-});
-
-treeEl.addEventListener("contextmenu", e => {
-  const tn = e.target.closest(".tn");
-  if (!tn) return;
-  e.preventDefault();
-  showMenu(e.clientX, e.clientY, folderMenuItems(tn.dataset.path));
-});
-
-// ── Track info modal ──────────────────────────────────────────────────────
-function showTrackInfo(idx) {
-  const t = ALL_TRACKS[idx];
-  const art = artOf(t);
-  $("modal-head").innerHTML = `
-    <div class="mh-art">${art ? `<img src="${esc(encPath(art))}" alt="">` : "♪"}</div>
-    <div>
-      <div class="mh-title">${esc(t.title || t.path)}</div>
-      <div class="mh-sub">${esc([t.artist, t.album].filter(Boolean).join(" — "))}</div>
-    </div>
-    <button id="modal-close" title="Close">✕</button>`;
-  const rows = [
-    ["Title", t.title], ["Artist", t.artist], ["Album", t.album],
-    ["Album artist", t.albumArtist], ["Track", t.track || ""], ["Disc", t.disc || ""],
-    ["Year", t.year], ["Genre", t.genre], ["Duration", fmt(t.duration)],
-    ["File", t.path],
-  ].filter(([,v]) => v !== "" && v !== null && v !== undefined);
-  $("modal-body").innerHTML = rows.map(([k,v]) =>
-    `<div class="mi-row"><div class="mi-k">${k}</div><div class="mi-v">${esc(v)}</div></div>`
-  ).join("");
-  $("modal-overlay").classList.add("open");
-  $("modal-close").addEventListener("click", hideModal);
-}
-function hideModal() { $("modal-overlay").classList.remove("open"); }
-$("modal-cancel").addEventListener("click", hideModal);
-$("modal-overlay").addEventListener("click", e => { if (e.target === $("modal-overlay")) hideModal(); });
-
-// ── Art hover preview ─────────────────────────────────────────────────────
-const previewEl  = $("artpreview");
-const previewImg = previewEl.querySelector("img");
-document.addEventListener("mouseover", e => {
-  const el = e.target.closest("[data-art]");
-  if (!el) return;
-  previewImg.src = el.dataset.art;
-  previewEl.style.display = "block";
-  const r = el.getBoundingClientRect();
-  requestAnimationFrame(() => {
-    const pw = previewEl.offsetWidth, ph = previewEl.offsetHeight;
-    let x = r.right + 10, y = r.top;
-    if (x + pw > innerWidth  - 8) x = Math.max(8, r.left - pw - 10);
-    if (y + ph > innerHeight - 8) y = Math.max(8, innerHeight - ph - 8);
-    previewEl.style.left = x + "px";
-    previewEl.style.top  = y + "px";
-  });
-});
-document.addEventListener("mouseout", e => {
-  if (e.target.closest && e.target.closest("[data-art]"))
-    previewEl.style.display = "none";
-});
-
-// ── Transport controls ────────────────────────────────────────────────────
-$("btn-play").addEventListener("click", () => {
-  if (audio.paused) audio.play(); else audio.pause();
-});
-$("btn-prev").addEventListener("click", playPrev);
-$("btn-next").addEventListener("click", playNext);
-$("btn-repeat").addEventListener("click", () => {
-  REPEAT = (REPEAT+1)%3;
-  const labels = ["🔁","🔁","🔂"];
-  $("btn-repeat").textContent = labels[REPEAT];
-  $("btn-repeat").classList.toggle("active", REPEAT>0);
-});
-$("btn-shuffle").addEventListener("click", () => {
-  SHUFFLED = !SHUFFLED;
-  $("btn-shuffle").classList.toggle("active", SHUFFLED);
-  if (SHUFFLED && QUEUE.length) shuffleQueue();
-});
-$("btn-shuffle-all").addEventListener("click", () => {
-  ACTIVE_FOLDER = null;
-  VIEW = ALL_TRACKS.map((_, i) => i);
-  buildQueue(0);
-  SHUFFLED = true;
-  shuffleQueue();
-  $("btn-shuffle").classList.add("active");
-  playTrack(QUEUE[0]);
-  renderTracks(VIEW, "");
-  $("settingspop").classList.remove("open");
-});
-
-// Audio events
-audio.addEventListener("timeupdate", () => {
-  if (!audio.duration) return;
-  scrubber.value = (audio.currentTime/audio.duration)*100;
-  timeCur.textContent = fmt(audio.currentTime);
-});
-audio.addEventListener("loadedmetadata", () => {
-  timeTot.textContent = fmt(audio.duration);
-});
-audio.addEventListener("ended", playNext);
-audio.addEventListener("play",  () => { $("btn-play").textContent = "⏸"; });
-audio.addEventListener("pause", () => { $("btn-play").textContent = "▶"; });
-
-scrubber.addEventListener("input", () => {
-  if (audio.duration) audio.currentTime = (scrubber.value/100)*audio.duration;
-});
-volEl.addEventListener("input", () => { audio.volume = volEl.value; });
-
-// Keyboard shortcuts
-document.addEventListener("keydown", e => {
-  if (e.key === "Escape") {
-    if ($("modal-overlay").classList.contains("open")) { hideModal(); return; }
-    if (ctxEl.classList.contains("open")) { hideMenu(); return; }
-  }
-  if (e.target.tagName === "INPUT") return;
-  if (e.code === "Space")      { e.preventDefault(); audio.paused?audio.play():audio.pause(); }
-  if (e.code === "ArrowRight") { audio.currentTime = Math.min(audio.duration||0, audio.currentTime+5); }
-  if (e.code === "ArrowLeft")  { audio.currentTime = Math.max(0, audio.currentTime-5); }
-  if (e.code === "ArrowUp")    { volEl.value=Math.min(1,+volEl.value+.05); audio.volume=volEl.value; }
-  if (e.code === "ArrowDown")  { volEl.value=Math.max(0,+volEl.value-.05); audio.volume=volEl.value; }
-  if (e.code === "KeyN")       playNext();
-  if (e.code === "KeyP")       playPrev();
-  if (e.code === "KeyF")       { searchEl.focus(); e.preventDefault(); }
-});
-
-// ── Tree interactions ─────────────────────────────────────────────────────
-treeEl.addEventListener("click", e => {
-  const tn = e.target.closest(".tn");
-  if (!tn) return;
-  const path = tn.dataset.path;
-
-  // Toggle expand/collapse
-  const childContainer = treeEl.querySelector(`.tc[data-parent="${CSS.escape(path)}"]`);
-  if (childContainer) {
-    const collapsed = childContainer.classList.toggle("collapsed");
-    tn.classList.toggle("open", !collapsed);
-  }
-
-  // Select folder
-  document.querySelectorAll(".tn").forEach(n => n.classList.remove("active"));
-  tn.classList.add("active");
-  ACTIVE_FOLDER = path;
-  doSearch(searchEl.value);
-});
-
-// Show all on logo click
-$("logo").style.cursor = "pointer";
-$("logo").addEventListener("click", () => {
-  document.querySelectorAll(".tn").forEach(n => n.classList.remove("active"));
-  ACTIVE_FOLDER = null;
-  searchEl.value = "";
-  doSearch("");
-});
-
-// ── Track click → play / pause toggle ─────────────────────────────────────
-tracksEl.addEventListener("click", e => {
-  const tr = e.target.closest(".tr");
-  if (!tr) return;
-  const idx = parseInt(tr.dataset.idx);
-  if (QUEUE[QUEUE_POS] === idx) {
-    // Clicking the current track toggles pause instead of restarting
-    if (audio.paused) audio.play(); else audio.pause();
-    return;
-  }
-  buildQueue(idx);
-  playTrack(idx);
-});
-
-// ── Search ────────────────────────────────────────────────────────────────
-searchEl.addEventListener("input", () => {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => doSearch(searchEl.value), 120);
-});
-searchEl.addEventListener("keydown", e => {
-  if (e.key === "Escape") { searchEl.value = ""; doSearch(""); }
-});
-
-// ── Settings popover ──────────────────────────────────────────────────────
-$("settingsbtn").addEventListener("click", e => {
-  e.stopPropagation();
-  $("settingspop").classList.toggle("open");
-});
-document.addEventListener("click", e => {
-  if (!$("settingspop").contains(e.target) && e.target !== $("settingsbtn"))
-    $("settingspop").classList.remove("open");
-});
-$("btn-clear-idb").addEventListener("click", async () => {
-  await clearIDB();
-  idbStatus.textContent = "IDB cleared. Reload the page to re-read audiodata.js.";
-});
-$("btn-reload").addEventListener("click", () => location.reload());
-
-// ── Font size setting (rem-based UI scale, persisted) ────────────────────
-const FS_MIN = 9, FS_MAX = 32, FS_DEF = 15;
-let fontSize = FS_DEF;
-try {
-  const saved = parseInt(localStorage.getItem("fontSize"));
-  if (!isNaN(saved)) fontSize = Math.min(FS_MAX, Math.max(FS_MIN, saved));
-} catch(_){}
-function applyFontSize() {
-  document.documentElement.style.fontSize = fontSize + "px";
-  $("fs-val").textContent = fontSize + "px";
-  try { localStorage.setItem("fontSize", fontSize); } catch(_){}
-}
-$("fs-minus").addEventListener("click", () => {
-  if (fontSize > FS_MIN) { fontSize--; applyFontSize(); }
-});
-$("fs-plus").addEventListener("click", () => {
-  if (fontSize < FS_MAX) { fontSize++; applyFontSize(); }
-});
-applyFontSize();
-
-// ── Resizer ───────────────────────────────────────────────────────────────
-(function() {
-  const resizer = $("resizer"), sidebar = $("sidebar");
-  let dragging = false, startX = 0, startW = 0;
-  resizer.addEventListener("mousedown", e => {
-    dragging = true; startX = e.clientX; startW = sidebar.offsetWidth;
-    resizer.classList.add("dragging");
-  });
-  document.addEventListener("mousemove", e => {
-    if (!dragging) return;
-    const w = Math.max(160, Math.min(520, startW + e.clientX - startX));
-    sidebar.style.width = w+"px";
-  });
-  document.addEventListener("mouseup", () => {
-    dragging = false; resizer.classList.remove("dragging");
-  });
-})();
-
-// ── Init ──────────────────────────────────────────────────────────────────
-function init() {
-  loaderEl.style.display = "none";
-
-  // Sort tracks: folder → disc → track → title
-  ALL_TRACKS.sort((a,b) => {
-    const fc = (a.folder||"").localeCompare(b.folder||"");
-    if (fc) return fc;
-    if (a.disc !== b.disc) return (a.disc||0)-(b.disc||0);
-    if (a.track !== b.track) return (a.track||0)-(b.track||0);
-    return (a.title||"").localeCompare(b.title||"");
-  });
-
-  VIEW = ALL_TRACKS.map((_, i) => i);
-  statsEl.textContent = `${ALL_TRACKS.length} tracks`;
-
-  // Build & render tree
-  const TREE_DATA = buildTree(ALL_TRACKS);
-  treeEl.innerHTML = renderTree(TREE_DATA, 0, "");
-
-  // Auto-expand root if few top-level folders
-  const roots = treeEl.querySelectorAll(".tn[data-depth='0']");
-  if (roots.length <= 5) {
-    roots.forEach(tn => {
-      const path = tn.dataset.path;
-      const cc = treeEl.querySelector(`.tc[data-parent="${CSS.escape(path)}"]`);
-      if (cc) { cc.classList.remove("collapsed"); tn.classList.add("open"); }
-    });
-  }
-
-  renderTracks(VIEW, "");
-
-  // Restore last track highlight (not auto-play, user must click)
-  try {
-    const last = sessionStorage.getItem("lastTrack");
-    if (last !== null) {
-      const t = ALL_TRACKS[parseInt(last)];
-      if (t) { updateNowBar(t); npTitle.style.color="var(--text3)"; }
-    }
-  } catch(_){}
-}
-
-boot();
-</script>
-</body>
-</html>
-"""
-
-def write_html(out_dir: Path):
-    out = out_dir / HTMLFILE
-    out.write_text(HTML_TEMPLATE.lstrip(), encoding="utf-8")
-    print(f"✓ Wrote {HTMLFILE}")
-
-def main():
-    args = parse_args()
-
-    # Take root from cli arg or current dir
-    root = Path(args.root).resolve() if args.root else Path.cwd()
+        top = Path(os.path.commonpath([str(p) for p in (out_dir, root, covers) if p]))
+    except ValueError:
+        die("--serve needs ROOT, OUTPUT and --covers on the same drive")
+    sub = out_dir.relative_to(top).as_posix()
+    url_path = "/" + urllib.parse.quote(f"{sub}/" if sub != "." else "") + HTMLFILE
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
+                          ".js": "text/javascript; charset=utf-8", ".mp3": "audio/mpeg", ".flac": "audio/flac",
+                          ".ogg": "audio/ogg", ".opus": "audio/ogg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+                          ".wav": "audio/wav", ".webm": "audio/webm", ".webp": "image/webp"}
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-cache")
+            super().end_headers()
+
+        def log_message(self, fmt, *args):
+            if verbose:
+                super().log_message(fmt, *args)
+
+        def handle(self):
+            with contextlib.suppress(ConnectionError):      # browsers abort media requests constantly
+                super().handle()
+
+    try:
+        httpd = http.server.ThreadingHTTPServer((host, port), functools.partial(Handler, directory=str(top)))
+    except OSError as e:
+        die(f"can't listen on {host}:{port} ({e.strerror or e})")
+    shown = "localhost" if host in ("127.0.0.1", "0.0.0.0", "::", "") else host
+    url = f"http://{shown}:{httpd.server_port}{url_path}"
+    info(f"\nServing {top}\n  {url}\n  (debug helper: no HTTP range support, so seeking is disabled · Ctrl-C stops)")
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        warn(f"listening on {host}: everything under {top} is readable from your network")
+    if open_browser:
+        open_url(url)
+    with httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            info("\nStopped.")
+
+
+def open_url(url: str) -> None:
+    with contextlib.suppress(Exception):
+        webbrowser.open_new_tab(url)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main(argv=None) -> int:
+    for s in (sys.stdout, sys.stderr):                      # never crash on a console that can't print ✓/█
+        with contextlib.suppress(Exception):
+            s.reconfigure(errors="replace")
+    a = parse_args(argv)
+    root = Path(a.root).expanduser().resolve() if a.root else Path.cwd().resolve()
     if not root.is_dir():
-        print(f"✗ Root directory not found: {root}", file=sys.stderr)
-        sys.exit(1)
+        die(f"Not a folder: {root}")
+    out_dir = Path(a.output).expanduser().resolve() if a.output else root
+    covers = Path(a.covers).expanduser().resolve() if a.covers else None
+    if out_dir.exists() and not out_dir.is_dir():         # created on first write, so an abort leaves nothing
+        die(f"Output is not a folder: {out_dir}")
+    page = out_dir / HTMLFILE
 
-    out_dir = Path(args.output).resolve() if args.output else root
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if a.extract_template:
+        if write_html(out_dir, a.force):
+            info(f"✓ Wrote {page}")
+        if a.serve:
+            serve(out_dir, root, covers, *a.serve, not a.no_open, a.verbose)
+        return 0
 
-    if args.extract_template:
-        print("Dumping HTML template only, skipping media scan.")
-        write_html(out_dir)
-        sys.exit(0)
+    info(f"mugal {VERSION}\nRoot   : {root}\nOutput : {out_dir}" + (f"\nExclude: {', '.join(a.exclude)}" if a.exclude else ""))
+    if not MutagenFile:
+        warn("mutagen is not installed — tracks are listed by file name only (no tags, durations or covers).")
+        for line in install_hint("mutagen", "enzyme"):
+            print(line, file=sys.stderr)
 
-    if not HAS_MUTAGEN:
-        print("❌  mutagen not installed — tags will be minimal. Run: pip install mutagen")
+    payload, st = scan(a, root, out_dir, covers)
+    size = write_datafile(payload, out_dir)
+    cached = st["files"] - st["parsed"]
+    info(f"✓ {st['files']} audio files in {st['secs']:.1f}s ({cached} cached, {st['parsed']} read)")
+    mb = f"{size / 1048576:.1f} MB" if size >= 1048576 else f"{max(1, size // 1024)} KB"
+    info(f"✓ {payload['count']} tracks · {fmt_hours(st['duration'])} · {DATAFILE} {mb}")
+    if st["unread"]:
+        warn(f"{st['unread']} unreadable file{'s' * (st['unread'] != 1)} skipped (corrupt or truncated)")
+    if st["no_reader"]:
+        warn(f"{st['no_reader']} file{'s' * (st['no_reader'] != 1)} listed by file name only (no tag reader)")
+    if st["short"]:
+        info(f"ℹ  {st['short']} track{'s' * (st['short'] != 1)} shorter than {a.min_duration:g}s skipped")
+    other = len(st["problems"]) - st["unread"] - st["no_reader"]
+    if other > 0:
+        warn(f"{other} other problem{'s' * (other != 1)} (unreadable folders, invalid names, covers)")
+    report = write_report(out_dir, st["problems"])
+    if report:
+        info(f"   Details: {report}" + ("" if a.verbose else "  (or run with -v)"))
+        if a.verbose:
+            for p, reason in st["problems"]:
+                info(f"   {reason}: {p}")
 
-    print(f"Root   : {root}")
-    print(f"Output : {out_dir}")
-    if args.exclude:
-        print(f"Exclude: {', '.join(args.exclude)}")
+    html_ok = not a.no_html and write_html(out_dir, a.force)
+    if html_ok:
+        info(f"✓ Wrote {HTMLFILE}")
+    if a.serve:
+        serve(out_dir, root, covers, *a.serve, not a.no_open, a.verbose)
+    elif page.exists():
+        info(f"\nOpen {page.as_uri()}")
+        if html_ok and not a.no_open:
+            open_url(page.as_uri())
+    return 0
 
-    # Scan
-    tracks, folder_art = scan(root, args)
-    if not tracks and not args.force_rescan:
-        sys.exit(0)
-
-    write_datafile(tracks, folder_art, out_dir, root)
-
-    # Write HTML (unless --no-html)
-    if not args.no_html:
-        write_html(out_dir)
-
-    out_abs = str((out_dir / HTMLFILE).absolute())
-    print(f"\nDone. Open {out_abs} in your browser.")
-    webbrowser.open_new_tab(f'file://{out_abs}')
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nAborted.", file=sys.stderr)
+        sys.exit(130)
